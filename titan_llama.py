@@ -176,7 +176,7 @@ class TitanLLaMAAttention(nn.Module):
         if use_cache:
             present_key_value = attn_intermediates.cached_key_values
 
-        return attn_output, attn_weights, present_key_value
+        return attn_output, attn_weights, present_key_value, attn_intermediates.value_residual
 
 
 class TitanLLaMADecoderLayer(nn.Module):
@@ -260,7 +260,7 @@ class TitanLLaMADecoderLayer(nn.Module):
         # Get value residual from previous layer if available
         value_residual = kwargs.get('value_residual', None)
         
-        hidden_states, self_attn_weights, present_key_value = self.self_attn(
+        hidden_states, self_attn_weights, present_key_value, new_value_residual = self.self_attn(
             hidden_states=hidden_states,
             attention_mask=attention_mask,
             position_ids=position_ids,
@@ -291,6 +291,9 @@ class TitanLLaMADecoderLayer(nn.Module):
 
         if use_cache:
             outputs += (present_key_value,)
+            
+        # Always include value residual for next layer
+        outputs += (new_value_residual,)
 
         return outputs
 
@@ -369,6 +372,9 @@ class TitanLLaMAModel(nn.Module):
             )
 
             hidden_states = layer_outputs[0]
+            
+            # Extract value residual for next layer (always last element)
+            value_residual = layer_outputs[-1]
 
             if use_cache:
                 next_decoder_cache += (layer_outputs[2 if output_attentions else 1],)
