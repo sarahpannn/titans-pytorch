@@ -2,6 +2,7 @@
 torch>=2.0.0
 torchvision
 torchaudio
+tensordict
 
 # Transformers and tokenizers
 transformers>=4.30.0

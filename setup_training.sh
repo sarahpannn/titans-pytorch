@@ -6,37 +6,37 @@ set -e
 
 echo "Setting up TitanLLaMA training environment..."
 
-# Create virtual environment if it doesn't exist
-if [ ! -d "venv" ]; then
-    echo "Creating virtual environment..."
-    python3 -m venv venv
-fi
+# # Create virtual environment if it doesn't exist
+# if [ ! -d "venv" ]; then
+#     echo "Creating virtual environment..."
+#     python3 -m venv venv
+# fi
 
-# Activate virtual environment
-source venv/bin/activate
+# # Activate virtual environment
+# source venv/bin/activate
 
-# Upgrade pip
-pip install --upgrade pip
+# # Upgrade pip
+# pip install --upgrade pip
 
-# Install PyTorch (adjust for your CUDA version)
-echo "Installing PyTorch..."
-pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
+# # Install PyTorch (adjust for your CUDA version)
+# echo "Installing PyTorch..."
+# pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
 
-# Install titans-pytorch dependencies
-echo "Installing titans-pytorch dependencies..."
-pip install einops
-pip install axial-positional-embedding
-pip install rotary-embedding-torch
-pip install x-transformers
+# # Install titans-pytorch dependencies
+# echo "Installing titans-pytorch dependencies..."
+# pip install einops
+# pip install axial-positional-embedding
+# pip install rotary-embedding-torch
+# pip install x-transformers
 
-# Try to install hyper-connections (might need to be installed from source)
-pip install git+https://github.com/lucidrains/hyper-connections.git || echo "Warning: Could not install hyper-connections"
+# # Try to install hyper-connections (might need to be installed from source)
+# pip install git+https://github.com/lucidrains/hyper-connections.git || echo "Warning: Could not install hyper-connections"
 
-# Install other requirements
-echo "Installing other requirements..."
-pip install -r requirements_training.txt
+# # Install other requirements
+# echo "Installing other requirements..."
+# pip install -r requirements_training.txt
 
-# Create necessary directories
+# # Create necessary directories
 echo "Creating directories..."
 mkdir -p titan_llama_checkpoints
 mkdir -p logs
@@ -76,14 +76,10 @@ except Exception as e:
 # Set up environment variables
 echo "Setting up environment variables..."
 export TOKENIZERS_PARALLELISM=false
-export WANDB_MODE=offline  # Set to online if you want to use wandb
+export WANDB_MODE=online  # Set to online if you want to use wandb
 
 echo ""
 echo "✓ Setup complete!"
-echo ""
-echo "To start training:"
-echo "  source venv/bin/activate"
-echo "  python run_training.py --help  # See all options"
 echo ""
 echo "Quick start (debug mode):"
 echo "  python run_training.py --debug --no_wandb"

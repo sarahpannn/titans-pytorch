@@ -1,0 +1,1 @@
+salloc -p mit_normal_gpu --gres=gpu:h100:1
