@@ -235,6 +235,7 @@ class TitanLLaMADecoderLayer(nn.Module):
 
         # Neural Memory processing (before attention)
         retrieved_memory = None
+        new_weight_residual = None
         if self.has_neural_memory:
             # Prepare input for neural memory (QKV format)
             memory_input = torch.stack([hidden_states, hidden_states, hidden_states])
@@ -242,13 +243,13 @@ class TitanLLaMADecoderLayer(nn.Module):
             retrieved_memory, new_memory_state = self.neural_memory(
                 memory_input,
                 state=self.memory_state,
-                prev_weights=self.memory_weight_residual
+                prev_weights=prev_weight_residual
             )
             
             # Update memory state for test-time training
             self.memory_state = new_memory_state
             if self.config.neural_mem_weight_residual:
-                self.memory_weight_residual = new_memory_state.updates
+                new_weight_residual = new_memory_state.updates
             
             # Add retrieved memory to residual if not gating attention output
             if not self.config.neural_mem_gate_attn_output:
@@ -259,6 +260,9 @@ class TitanLLaMADecoderLayer(nn.Module):
         
         # Get value residual from previous layer if available
         value_residual = kwargs.get('value_residual', None)
+        
+        # Get weight residual from previous neural memory layer if available
+        prev_weight_residual = kwargs.get('prev_weight_residual', None)
         
         hidden_states, self_attn_weights, present_key_value, new_value_residual = self.self_attn(
             hidden_states=hidden_states,
@@ -292,8 +296,8 @@ class TitanLLaMADecoderLayer(nn.Module):
         if use_cache:
             outputs += (present_key_value,)
             
-        # Always include value residual for next layer
-        outputs += (new_value_residual,)
+        # Always include value residual and weight residual for next layer
+        outputs += (new_value_residual, new_weight_residual)
 
         return outputs
 
@@ -343,8 +347,9 @@ class TitanLLaMAModel(nn.Module):
 
         hidden_states = inputs_embeds
 
-        # Track value residuals for attention layers
+        # Track value residuals for attention layers and weight residuals for neural memory
         value_residual = None
+        prev_weight_residual = None
         
         # Initialize cache if needed
         if use_cache and past_key_values is None:
@@ -369,12 +374,14 @@ class TitanLLaMAModel(nn.Module):
                 use_cache=use_cache,
                 cache_position=cache_position,
                 value_residual=value_residual,
+                prev_weight_residual=prev_weight_residual,
             )
 
             hidden_states = layer_outputs[0]
             
-            # Extract value residual for next layer (always last element)
-            value_residual = layer_outputs[-1]
+            # Extract value residual and weight residual for next layer (last two elements)
+            value_residual = layer_outputs[-2]
+            prev_weight_residual = layer_outputs[-1]
 
             if use_cache:
                 next_decoder_cache += (layer_outputs[2 if output_attentions else 1],)
