@@ -1,0 +1,52 @@
+# Core PyTorch and training dependencies
+torch>=2.0.0
+torchvision
+torchaudio
+
+# Transformers and tokenizers
+transformers>=4.30.0
+tokenizers
+datasets>=2.10.0
+
+# Optimization and distributed training
+accelerate>=0.20.0
+
+# Neural network utilities
+einops>=0.6.0
+
+# Positional embeddings (required by titans-pytorch)
+axial-positional-embedding
+rotary-embedding-torch
+
+# Attention mechanisms
+x-transformers
+
+# Hyper connections
+hyper-connections
+
+# Progress bars and logging
+tqdm
+wandb
+tensorboard
+
+# Data processing
+numpy>=1.21.0
+pandas
+
+# Configuration and utilities
+omegaconf
+hydra-core
+pyyaml
+
+# Development and debugging
+ipython
+jupyter
+matplotlib
+seaborn
+
+# Memory profiling
+psutil
+py3nvml
+
+# Optional: for faster attention on CUDA
+# triton  # Uncomment if using custom kernels
