@@ -182,8 +182,12 @@ class TitanLLaMAAttention(nn.Module):
 class TitanLLaMADecoderLayer(nn.Module):
     """
     Titan-LLaMA Decoder Layer that integrates neural memory with standard transformer components.
+
+    This version **disables cross-layer weight-residual mixing** for the Titans NeuralMemory.
+    That avoids the prev_weights + weights_for_surprise shape issues and the XNOR asserts,
+    while still letting each layer use its own NeuralMemory as a sidecar adapter.
     """
-    
+
     def __init__(self, config: TitanLLaMAConfig, layer_idx: int):
         super().__init__()
         self.config = config
@@ -193,31 +197,40 @@ class TitanLLaMADecoderLayer(nn.Module):
         # Attention and MLP
         self.self_attn = TitanLLaMAAttention(config=config, layer_idx=layer_idx)
         self.mlp = TitanLLaMAMLP(config)
-        
-        # Layer norms
-        self.input_layernorm = TitanLLaMARMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = TitanLLaMARMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
-        # Neural Memory integration
+        # Layer norms
+        self.input_layernorm = TitanLLaMARMSNorm(
+            config.hidden_size, eps=config.rms_norm_eps
+        )
+        self.post_attention_layernorm = TitanLLaMARMSNorm(
+            config.hidden_size, eps=config.rms_norm_eps
+        )
+
+        # ----------------------------
+        # Neural Memory sidecar
+        # ----------------------------
         self.has_neural_memory = layer_idx in config.neural_memory_layers
+
         if self.has_neural_memory:
             neural_memory_model = MemoryMLP(
                 dim=config.hidden_size,
-                depth=config.neural_memory_depth
+                depth=config.neural_memory_depth,
             )
-            
+
+            # IMPORTANT: force accept_weight_residual = False
+            # so self.to_learned_weight_residual_mix is None and
+            # prev_weights is always expected to be None inside Titans.
             self.neural_memory = NeuralMemory(
                 dim=config.hidden_size,
                 chunk_size=config.neural_memory_segment_len,
                 batch_size=config.neural_memory_batch_size,
                 model=neural_memory_model,
                 qkv_receives_diff_views=config.neural_mem_qkv_receives_diff_view,
-                accept_weight_residual=config.neural_mem_weight_residual and layer_idx > 0
+                accept_weight_residual=False,
             )
-            
-            # Memory state for test-time training
+
+            # Per-layer memory state (for TTT / long sequences)
             self.memory_state = None
-            self.memory_weight_residual = None
 
     def forward(
         self,
@@ -229,77 +242,89 @@ class TitanLLaMADecoderLayer(nn.Module):
         use_cache: Optional[bool] = False,
         cache_position: Optional[torch.LongTensor] = None,
         **kwargs,
-    ) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
-        
+    ) -> Tuple[torch.FloatTensor, ...]:
+
         residual = hidden_states
 
-        # Neural Memory processing (before attention)
-        retrieved_memory = None
-        new_weight_residual = None
+        # Value residual from previous attention layer
+        value_residual: Optional[torch.Tensor] = kwargs.get("value_residual", None)
+
+        # ------------------------------------------------------------------
+        # Neural Memory (before attention)
+        # ------------------------------------------------------------------
+        retrieved_memory: Optional[torch.Tensor] = None
+
         if self.has_neural_memory:
-            # Prepare input for neural memory (QKV format)
-            memory_input = torch.stack([hidden_states, hidden_states, hidden_states])
-            
-            retrieved_memory, new_memory_state = self.neural_memory(
+            # QKV-style input: 3 x B x T x D
+            memory_input = torch.stack(
+                [hidden_states, hidden_states, hidden_states]
+            )
+
+            # NOTE: prev_weights is always None here (no weight-residual path).
+            retrieved_memory, self.memory_state = self.neural_memory(
                 memory_input,
                 state=self.memory_state,
-                prev_weights=prev_weight_residual
+                prev_weights=None,
             )
-            
-            # Update memory state for test-time training
-            self.memory_state = new_memory_state
-            if self.config.neural_mem_weight_residual:
-                new_weight_residual = new_memory_state.updates
-            
-            # Add retrieved memory to residual if not gating attention output
-            if not self.config.neural_mem_gate_attn_output:
+
+            # If we're not gating, inject memory directly into the residual stream.
+            if not self.config.neural_mem_gate_attn_output and retrieved_memory is not None:
                 residual = residual + retrieved_memory
 
-        # Attention
+        # ------------------------------------------------------------------
+        # Self Attention
+        # ------------------------------------------------------------------
         hidden_states = self.input_layernorm(hidden_states)
-        
-        # Get value residual from previous layer if available
-        value_residual = kwargs.get('value_residual', None)
-        
-        # Get weight residual from previous neural memory layer if available
-        prev_weight_residual = kwargs.get('prev_weight_residual', None)
-        
-        hidden_states, self_attn_weights, present_key_value, new_value_residual = self.self_attn(
-            hidden_states=hidden_states,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            past_key_value=past_key_value,
-            output_attentions=output_attentions,
-            use_cache=use_cache,
-            cache_position=cache_position,
-            value_residual=value_residual,
-        )
 
-        # Apply memory gating if configured
-        if self.has_neural_memory and self.config.neural_mem_gate_attn_output:
+        hidden_states, self_attn_weights, present_key_value, new_value_residual = \
+            self.self_attn(
+                hidden_states=hidden_states,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_value=past_key_value,
+                output_attentions=output_attentions,
+                use_cache=use_cache,
+                cache_position=cache_position,
+                value_residual=value_residual,
+            )
+
+        # If configured, gate attention output by retrieved memory
+        if (
+            self.has_neural_memory
+            and self.config.neural_mem_gate_attn_output
+            and retrieved_memory is not None
+        ):
             gate = retrieved_memory.sigmoid()
             hidden_states = hidden_states * gate
 
+        # Standard residual after attention
         hidden_states = residual + hidden_states
 
-        # Feedforward Network
-        residual = hidden_states
+        # ------------------------------------------------------------------
+        # Feedforward
+        # ------------------------------------------------------------------
+        residual_ff = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = self.mlp(hidden_states)
-        hidden_states = residual + hidden_states
+        hidden_states = residual_ff + hidden_states
 
-        outputs = (hidden_states,)
+        # ------------------------------------------------------------------
+        # Pack outputs
+        # ------------------------------------------------------------------
+        outputs: Tuple[torch.Tensor, ...] = (hidden_states,)
 
         if output_attentions:
             outputs += (self_attn_weights,)
 
         if use_cache:
             outputs += (present_key_value,)
-            
-        # Always include value residual and weight residual for next layer
+
+        # Value residual for next attention layer
+        new_weight_residual = None  # no cross-layer weight residuals in this variant
         outputs += (new_value_residual, new_weight_residual)
 
         return outputs
+
 
 
 class TitanLLaMAModel(nn.Module):

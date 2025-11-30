@@ -141,7 +141,7 @@ class SlimPajamaDataset(Dataset):
             dataset_name,
             split=split,
             streaming=streaming,
-            trust_remote_code=True
+            # trust_remote_code=True
         )
         
         # For demonstration, we'll take a subset for the 1B token target

@@ -116,7 +116,7 @@ def create_config_from_args(args):
     
     # Debug mode adjustments
     if args.debug:
-        config.total_tokens = 1_000_000  # 1M tokens for debugging
+        config.total_tokens = 100_000  # 100K tokens for debugging
         config.eval_interval = 100
         config.save_interval = 500
         config.log_interval = 10
