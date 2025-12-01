@@ -11,7 +11,6 @@ from titans_pytorch import (
     MemoryMLP
 )
 from titans_pytorch.mac_transformer import SegmentedAttention, create_mac_block_mask
-
 try:
     from torch.nn.attention.flex_attention import flex_attention
     if torch.cuda.is_available():
@@ -47,6 +46,10 @@ class TitanLLaMAConfig:
         neural_mem_gate_attn_output: bool = False,
         neural_mem_weight_residual: bool = True,
         neural_mem_qkv_receives_diff_view: bool = True,
+        # Pretrained backbone support
+        use_pretrained_backbone: bool = False,
+        base_model_name_or_path: Optional[str] = None,
+        freeze_backbone: bool = True,
     ):
         self.vocab_size = vocab_size
         self.hidden_size = hidden_size
@@ -71,6 +74,45 @@ class TitanLLaMAConfig:
         self.neural_mem_gate_attn_output = neural_mem_gate_attn_output
         self.neural_mem_weight_residual = neural_mem_weight_residual
         self.neural_mem_qkv_receives_diff_view = neural_mem_qkv_receives_diff_view
+        self.use_pretrained_backbone = use_pretrained_backbone
+        self.base_model_name_or_path = base_model_name_or_path
+        self.freeze_backbone = freeze_backbone
+
+    @classmethod
+    def from_llama_config(cls, llama_config, **overrides):
+        """Create a Titan config from a Hugging Face LLaMA config while preserving Titan-specific overrides."""
+        titan_specific_keys = {
+            'segment_len',
+            'num_persist_mem_tokens',
+            'num_longterm_mem_tokens',
+            'neural_memory_layers',
+            'neural_memory_segment_len',
+            'neural_memory_batch_size',
+            'neural_memory_depth',
+            'use_flex_attn',
+            'sliding_window_attn',
+            'neural_mem_gate_attn_output',
+            'neural_mem_weight_residual',
+            'neural_mem_qkv_receives_diff_view',
+            'use_pretrained_backbone',
+            'base_model_name_or_path',
+            'freeze_backbone',
+        }
+
+        titan_kwargs = {k: v for k, v in overrides.items() if k in titan_specific_keys}
+
+        return cls(
+            vocab_size=llama_config.vocab_size,
+            hidden_size=llama_config.hidden_size,
+            intermediate_size=llama_config.intermediate_size,
+            num_hidden_layers=llama_config.num_hidden_layers,
+            num_attention_heads=llama_config.num_attention_heads,
+            num_key_value_heads=getattr(llama_config, "num_key_value_heads", llama_config.num_attention_heads),
+            max_position_embeddings=getattr(llama_config, "max_position_embeddings", 2048),
+            rms_norm_eps=getattr(llama_config, "rms_norm_eps", 1e-6),
+            rope_theta=getattr(llama_config, "rope_theta", 10000.0),
+            **titan_kwargs,
+        )
 
 
 class TitanLLaMARMSNorm(nn.Module):
@@ -236,6 +278,8 @@ class TitanLLaMADecoderLayer(nn.Module):
         # Neural Memory processing (before attention)
         retrieved_memory = None
         new_weight_residual = None
+        value_residual = kwargs.get('value_residual', None)
+        prev_weight_residual = kwargs.get('prev_weight_residual', None)
         if self.has_neural_memory:
             # Prepare input for neural memory (QKV format)
             memory_input = torch.stack([hidden_states, hidden_states, hidden_states])
@@ -257,12 +301,6 @@ class TitanLLaMADecoderLayer(nn.Module):
 
         # Attention
         hidden_states = self.input_layernorm(hidden_states)
-        
-        # Get value residual from previous layer if available
-        value_residual = kwargs.get('value_residual', None)
-        
-        # Get weight residual from previous neural memory layer if available
-        prev_weight_residual = kwargs.get('prev_weight_residual', None)
         
         hidden_states, self_attn_weights, present_key_value, new_value_residual = self.self_attn(
             hidden_states=hidden_states,
@@ -421,6 +459,7 @@ class TitanLLaMAForCausalLM(nn.Module):
 
     def __init__(self, config: TitanLLaMAConfig):
         super().__init__()
+        self.config = config
         self.model = TitanLLaMAModel(config)
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
@@ -584,3 +623,119 @@ class TitanLLaMAForCausalLM(nn.Module):
             #     break
                 
         return generated_tokens
+
+    @staticmethod
+    def _repeat_kv_weights(weight: torch.Tensor, repeat_factor: int) -> torch.Tensor:
+        """Repeat kv projection weights for grouped query attention backbones."""
+        if repeat_factor == 1:
+            return weight
+        return weight.repeat_interleave(repeat_factor, dim=0)
+
+    @classmethod
+    def from_pretrained_llama(
+        cls,
+        base_model_name_or_path: str,
+        titan_config: Optional[TitanLLaMAConfig] = None,
+        freeze_backbone: bool = True,
+        torch_dtype: Optional[torch.dtype] = None,
+        device_map: Optional[str] = None,
+        **from_pretrained_kwargs,
+    ):
+        """
+        Build TitanLLaMA from a pretrained LLaMA checkpoint.
+        The base model is frozen (unless specified otherwise) and only neural memory modules remain trainable.
+        """
+        try:
+            from transformers import AutoModelForCausalLM, AutoConfig
+        except ImportError as exc:
+            raise ImportError("transformers is required to load a pretrained LLaMA backbone") from exc
+
+        base_cfg = AutoConfig.from_pretrained(base_model_name_or_path, **from_pretrained_kwargs)
+
+        titan_kwargs = {}
+        if titan_config is not None:
+            titan_kwargs = {
+                'segment_len': titan_config.segment_len,
+                'num_persist_mem_tokens': titan_config.num_persist_mem_tokens,
+                'num_longterm_mem_tokens': titan_config.num_longterm_mem_tokens,
+                'neural_memory_layers': titan_config.neural_memory_layers,
+                'neural_memory_segment_len': titan_config.neural_memory_segment_len,
+                'neural_memory_batch_size': titan_config.neural_memory_batch_size,
+                'neural_memory_depth': titan_config.neural_memory_depth,
+                'use_flex_attn': titan_config.use_flex_attn,
+                'sliding_window_attn': titan_config.sliding_window_attn,
+                'neural_mem_gate_attn_output': titan_config.neural_mem_gate_attn_output,
+                'neural_mem_weight_residual': titan_config.neural_mem_weight_residual,
+                'neural_mem_qkv_receives_diff_view': titan_config.neural_mem_qkv_receives_diff_view,
+            }
+
+        titan_cfg = TitanLLaMAConfig.from_llama_config(
+            base_cfg,
+            use_pretrained_backbone=True,
+            base_model_name_or_path=base_model_name_or_path,
+            freeze_backbone=freeze_backbone,
+            **titan_kwargs,
+        )
+
+        model = cls(titan_cfg)
+
+        base_model = AutoModelForCausalLM.from_pretrained(
+            base_model_name_or_path,
+            torch_dtype=torch_dtype,
+            device_map=device_map,
+            **from_pretrained_kwargs,
+        )
+
+        model._load_llama_weights(base_model)
+
+        if freeze_backbone:
+            model.freeze_backbone()
+
+        return model
+
+    def _load_llama_weights(self, llama_model):
+        """Load weights from a pretrained LLaMA into the segmented-attention Titan model."""
+        llama_layers = llama_model.model.layers
+
+        with torch.no_grad():
+            # Embeddings and LM head
+            self.model.embed_tokens.weight.copy_(llama_model.model.embed_tokens.weight)
+            self.lm_head.weight.copy_(llama_model.lm_head.weight)
+
+            # Final norm
+            self.model.norm.weight.copy_(llama_model.model.norm.weight)
+
+            num_kv_groups = max(1, self.config.num_attention_heads // self.config.num_key_value_heads)
+
+            # Per-layer weights
+            for titan_layer, llama_layer in zip(self.model.layers, llama_layers):
+                # RMSNorms
+                titan_layer.input_layernorm.weight.copy_(llama_layer.input_layernorm.weight)
+                titan_layer.post_attention_layernorm.weight.copy_(llama_layer.post_attention_layernorm.weight)
+
+                # Attention projections
+                q_weight = llama_layer.self_attn.q_proj.weight
+                k_weight = self._repeat_kv_weights(llama_layer.self_attn.k_proj.weight, num_kv_groups)
+                v_weight = self._repeat_kv_weights(llama_layer.self_attn.v_proj.weight, num_kv_groups)
+                to_qkv = torch.cat([q_weight, k_weight, v_weight], dim=0)
+                titan_layer.self_attn.segmented_attn.to_qkv.weight.copy_(to_qkv)
+                titan_layer.self_attn.segmented_attn.to_out.weight.copy_(llama_layer.self_attn.o_proj.weight)
+
+                # MLP
+                titan_layer.mlp.gate_proj.weight.copy_(llama_layer.mlp.gate_proj.weight)
+                titan_layer.mlp.up_proj.weight.copy_(llama_layer.mlp.up_proj.weight)
+                titan_layer.mlp.down_proj.weight.copy_(llama_layer.mlp.down_proj.weight)
+
+    def freeze_backbone(self):
+        """Freeze pretrained backbone weights while keeping neural memory (and persistent memories) trainable."""
+        for name, param in self.named_parameters():
+            # keep neural memory trainable
+            if 'neural_memory' in name:
+                continue
+
+            # allow segmented attention persistent memory to remain trainable
+            if 'persistent_memory' in name:
+                continue
+
+            # freeze everything else
+            param.requires_grad = False
