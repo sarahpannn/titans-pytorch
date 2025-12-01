@@ -85,7 +85,7 @@ class TrainingConfig:
     
     # Data
     dataset_name: str = "cerebras/SlimPajama-627B"
-    tokenizer_name: str = "huggingface/CodeBERTa-small-v1"  # Will be overridden
+    tokenizer_name: str = "meta-llama/Meta-Llama-3.1-8B"  # align with pretrained backbone by default
     num_proc: int = 8
     
     # Distributed training
@@ -101,6 +101,11 @@ class TrainingConfig:
     
     # Resume training
     resume_from_checkpoint: Optional[str] = None
+    
+    # Pretrained backbone
+    use_pretrained_backbone: bool = True
+    base_model_name: Optional[str] = "meta-llama/Meta-Llama-3.1-8B"
+    freeze_backbone: bool = True
     
     def __post_init__(self):
         # Calculate total training steps
@@ -121,7 +126,7 @@ class SlimPajamaDataset(Dataset):
     def __init__(
         self, 
         dataset_name: str = "cerebras/SlimPajama-627B",
-        tokenizer_name: str = "meta-llama/Llama-2-7b-hf", 
+        tokenizer_name: str = "meta-llama/Meta-Llama-3.1-8B", 
         max_length: int = 2048,
         streaming: bool = True,
         split: str = "train",
@@ -235,37 +240,60 @@ def create_model_and_optimizer(config: TrainingConfig, device):
         sliding_window_attn=config.sliding_window_attn,
         neural_mem_gate_attn_output=config.neural_mem_gate_attn_output,
         neural_mem_weight_residual=config.neural_mem_weight_residual,
+        use_pretrained_backbone=config.use_pretrained_backbone,
+        base_model_name_or_path=config.base_model_name,
+        freeze_backbone=config.freeze_backbone,
     )
     
     # Create model
-    model = TitanLLaMAForCausalLM(model_config)
+    if config.use_pretrained_backbone and config.base_model_name:
+        model = TitanLLaMAForCausalLM.from_pretrained_llama(
+            base_model_name_or_path=config.base_model_name,
+            titan_config=model_config,
+            freeze_backbone=config.freeze_backbone,
+        )
+    else:
+        model = TitanLLaMAForCausalLM(model_config)
     model = model.to(device)
+    
+    # Align training config with backbone in case it was derived from a pretrained checkpoint
+    config.hidden_size = model.model.config.hidden_size
+    config.intermediate_size = model.model.config.intermediate_size
+    config.num_hidden_layers = model.model.config.num_hidden_layers
+    config.num_attention_heads = model.model.config.num_attention_heads
+    config.num_key_value_heads = model.model.config.num_key_value_heads
+    config.vocab_size = model.model.config.vocab_size
     
     # Print model size
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    frozen_params = total_params - trainable_params
     print(f"Total parameters: {total_params:,}")
     print(f"Trainable parameters: {trainable_params:,}")
+    print(f"Frozen parameters: {frozen_params:,}")
     
     # Separate neural memory parameters for different optimization
     neural_memory_params = []
     regular_params = []
     
     for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
         if 'neural_memory' in name:
             neural_memory_params.append(param)
         else:
             regular_params.append(param)
     
     # Create optimizers
-    optimizer_groups = [
-        {
+    optimizer_groups = []
+
+    if regular_params:
+        optimizer_groups.append({
             'params': regular_params,
             'lr': config.learning_rate,
             'weight_decay': config.weight_decay,
             'betas': (config.beta1, config.beta2)
-        }
-    ]
+        })
     
     if neural_memory_params:
         optimizer_groups.append({
@@ -276,6 +304,9 @@ def create_model_and_optimizer(config: TrainingConfig, device):
         })
         print(f"Neural memory parameters: {sum(p.numel() for p in neural_memory_params):,}")
     
+    if not optimizer_groups:
+        raise ValueError("No trainable parameters were found. Ensure backbone freezing is configured correctly.")
+
     optimizer = AdamW(optimizer_groups)
     
     # Learning rate scheduler
@@ -376,6 +407,10 @@ def main():
     
     # Set up logging
     logger = setup_logging(config)
+    logger.info(
+        f"Backbone: {config.base_model_name} | use_pretrained={config.use_pretrained_backbone} | "
+        f"freeze_backbone={config.freeze_backbone}"
+    )
     
     # Set up distributed training
     is_main_process = setup_distributed(config)
@@ -401,6 +436,7 @@ def main():
     logger.info("Creating datasets...")
     train_dataset = SlimPajamaDataset(
         dataset_name=config.dataset_name,
+        tokenizer_name=config.tokenizer_name,
         max_length=config.sequence_length,
         streaming=True,
         split="train",
@@ -410,6 +446,7 @@ def main():
     # For validation, we'll use a small subset
     eval_dataset = SlimPajamaDataset(
         dataset_name=config.dataset_name,
+        tokenizer_name=config.tokenizer_name,
         max_length=config.sequence_length,
         streaming=True,
         split="validation" if "validation" in ["train"] else "train",  # Use train split for now

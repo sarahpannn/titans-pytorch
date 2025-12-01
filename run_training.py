@@ -29,6 +29,9 @@ def parse_args():
     parser.add_argument("--neural_memory_layers", type=str, default="4,8,12,16,20", 
                        help="Comma-separated layer indices for neural memory")
     parser.add_argument("--neural_memory_segment_len", type=int, default=64, help="Neural memory segment length")
+    parser.add_argument("--base_model_name", type=str, default="meta-llama/Meta-Llama-3.1-8B", help="Pretrained LLaMA checkpoint for backbone")
+    parser.add_argument("--no_pretrained_backbone", action="store_true", help="Train from scratch instead of using a pretrained LLaMA backbone")
+    parser.add_argument("--unfreeze_backbone", action="store_true", help="Allow backbone weights to update (default keeps them frozen)")
     
     # Training configuration
     parser.add_argument("--total_tokens", type=int, default=1_000_000_000, help="Total tokens to train on")
@@ -42,7 +45,7 @@ def parse_args():
     
     # Data
     parser.add_argument("--dataset_name", type=str, default="cerebras/SlimPajama-627B", help="Dataset name")
-    parser.add_argument("--tokenizer_name", type=str, default="meta-llama/Llama-2-7b-hf", help="Tokenizer name")
+    parser.add_argument("--tokenizer_name", type=str, default="meta-llama/Meta-Llama-3.1-8B", help="Tokenizer name")
     
     # Logging and checkpointing
     parser.add_argument("--output_dir", type=str, default="./titan_llama_checkpoints", help="Output directory")
@@ -84,6 +87,9 @@ def create_config_from_args(args):
         num_longterm_mem_tokens=args.num_longterm_mem,
         neural_memory_layers=neural_memory_layers,
         neural_memory_segment_len=args.neural_memory_segment_len,
+        use_pretrained_backbone=not args.no_pretrained_backbone,
+        base_model_name=args.base_model_name,
+        freeze_backbone=not args.unfreeze_backbone,
         
         # Training config
         total_tokens=args.total_tokens,
@@ -147,6 +153,7 @@ def main_with_args():
     print("TitanLLaMA Training Configuration")
     print("="*80)
     print(f"Model: {config.model_name}")
+    print(f"Backbone: {config.base_model_name} | Pretrained: {config.use_pretrained_backbone} | Frozen: {config.freeze_backbone}")
     print(f"Hidden Size: {config.hidden_size}")
     print(f"Layers: {config.num_hidden_layers}")
     print(f"Neural Memory Layers: {config.neural_memory_layers}")
