@@ -389,6 +389,7 @@ def evaluate_model(model, eval_dataloader, device, max_eval_steps=100):
     """Evaluate model on validation set."""
     model.eval()
     total_loss = 0
+    total_accuracy = 0
     num_steps = 0
     
     with torch.no_grad():
@@ -406,10 +407,15 @@ def evaluate_model(model, eval_dataloader, device, max_eval_steps=100):
             loss = outputs['loss']
             
             total_loss += loss.item()
+            total_accuracy += outputs['correct']
             num_steps += 1
     
     model.train()
-    return total_loss / num_steps if num_steps > 0 else float('inf')
+
+    return {
+        'loss': total_loss / num_steps if num_steps > 0 else float('inf'),
+        'acc': total_accuracy / num_steps if num_steps > 0 else float('inf'),
+        }
 
 
 def main():
@@ -501,6 +507,7 @@ def main():
     
     model.train()
     running_loss = 0.0
+    running_accuracy = 0.0
     log_steps = 0
     
     data_iter = iter(train_dataloader)
@@ -508,6 +515,7 @@ def main():
     for step in tqdm(range(start_step, config.total_steps), desc="Training", disable=not is_main_process):
         
         epoch_loss = 0.0
+        epoch_accuracy = 0.0
         
         # Gradient accumulation loop
         for micro_step in range(config.gradient_accumulation_steps):
@@ -528,10 +536,12 @@ def main():
             # Backward pass
             loss.backward()
             epoch_loss += loss.item()
+            epoch_accuracy += outputs['correct'].item()
 
             if wandb and wandb.run:
                 wandb.log({
                     'train/mini_batch_loss': loss.item(),
+                    'train/mini_batch_accuracy': outputs['correct'].item()
                 })
         
         # Gradient clipping
@@ -548,10 +558,12 @@ def main():
         
         # Logging
         running_loss += epoch_loss
+        running_accuracy += epoch_accuracy
         log_steps += 1
         
         if step % config.log_interval == 0 and is_main_process:
             avg_loss = running_loss / log_steps
+            avg_acc = running_accuracy / log_steps
             lr = scheduler.get_last_lr()[0]
             
             logger.info(
@@ -565,18 +577,21 @@ def main():
             if wandb and wandb.run:
                 wandb.log({
                     'train/loss': avg_loss,
+                    'train/accuracy': avg_acc,
                     'train/learning_rate': lr,
                     'train/step': step,
                     'train/tokens_processed': step * config.tokens_per_batch
                 })
             
             running_loss = 0.0
+            running_accuracy = 0.0
             log_steps = 0
         
         # Evaluation
         if step % config.eval_interval == 0 and step > 0 and is_main_process:
             logger.info("Running evaluation...")
-            eval_loss = evaluate_model(model, eval_dataloader, device)
+            ret_dict = evaluate_model(model, eval_dataloader, device)
+            eval_loss, eval_acc = ret_dict['loss'], ret_dict['acc']
             
             logger.info(f"Eval loss: {eval_loss:.4f}")
             
@@ -606,12 +621,14 @@ def main():
         logger.info("Training completed!")
         
         # Final evaluation
-        final_eval_loss = evaluate_model(model, eval_dataloader, device)
+        ret_dict = evaluate_model(model, eval_dataloader, device)
+        final_eval_loss, final_eval_acc = ret_dict['loss'], ret_dict['acc']
         logger.info(f"Final eval loss: {final_eval_loss:.4f}")
         
         if wandb and wandb.run:
             wandb.log({
                 'eval/final_loss': final_eval_loss,
+                'eval/final_acc': final_eval_acc,
                 'train/final_step': config.total_steps
             })
             wandb.finish()

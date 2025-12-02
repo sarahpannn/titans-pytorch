@@ -538,6 +538,7 @@ class TitanLLaMAForCausalLM(nn.Module):
         hidden_states = outputs['last_hidden_state'] if return_dict else outputs[0]
         # print(f"pre lm-head hidden_states: {hidden_states}")
         logits = self.lm_head(hidden_states)
+        correct = 0.0
 
         loss = None
         if labels is not None:
@@ -552,6 +553,8 @@ class TitanLLaMAForCausalLM(nn.Module):
             shift_labels = shift_labels.to(shift_logits.device)
             loss = loss_fct(shift_logits, shift_labels)
             # print("LOSS: ", loss)
+            predictions = torch.argmax(shift_logits, dim=-1)
+            correct = (predictions == shift_labels) & mask
 
         if not return_dict:
             output = (logits,) + outputs[1:]
@@ -559,6 +562,7 @@ class TitanLLaMAForCausalLM(nn.Module):
 
         return {
             'loss': loss,
+            'correct', correct.sum().float(),
             'logits': logits,
             'past_key_values': outputs.get('past_key_values'),
             'hidden_states': outputs.get('hidden_states'),
