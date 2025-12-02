@@ -150,23 +150,36 @@ class TitanSegmentedLM(LM):
                 context, return_tensors="pt", add_special_tokens=False
             )
             inputs = {k: _to_device(v, self.device) for k, v in inputs.items()}
+            gen_text = self._greedy_generate(inputs, max_new_tokens=max_new_tokens, stop_tokens=until)
+            generations.append(gen_text)
+        return generations
+
+    def _greedy_generate(self, inputs: dict, max_new_tokens: int, stop_tokens: Sequence[str]) -> str:
+        """Lightweight greedy decode since TitanLLaMAForCausalLM lacks HF .generate()."""
+        input_ids = inputs["input_ids"]
+        attention_mask = inputs.get("attention_mask", torch.ones_like(input_ids, device=self.device))
+        generated = input_ids
+
+        for _ in range(max_new_tokens):
             with torch.no_grad():
-                output = self.model.generate(
-                    **inputs,
-                    max_new_tokens=max_new_tokens,
-                    do_sample=False,
-                    pad_token_id=self.tokenizer.eos_token_id,
-                    eos_token_id=self.tokenizer.eos_token_id,
-                )
-            gen_tokens = output[0][inputs["input_ids"].shape[1] :]
-            text = self.tok_decode(gen_tokens.tolist())
-            for stopper in until:
+                out = self.model(input_ids=generated, attention_mask=attention_mask)
+                logits = out["logits"][:, -1, :]
+                next_token = torch.argmax(logits, dim=-1, keepdim=True)
+
+            generated = torch.cat([generated, next_token], dim=-1)
+            attention_mask = torch.ones_like(generated, device=self.device)
+
+            # Check stop tokens in decoded text
+            text = self.tok_decode(generated[0].tolist()[input_ids.shape[1] :])
+            for stopper in stop_tokens:
                 stop_idx = text.find(stopper)
                 if stop_idx != -1:
-                    text = text[:stop_idx]
-                    break
-            generations.append(text)
-        return generations
+                    return text[:stop_idx]
+
+            if next_token.item() == self.tokenizer.eos_token_id:
+                break
+
+        return self.tok_decode(generated[0].tolist()[input_ids.shape[1] :])
 
     # --- Helpers ------------------------------------------------------------------
     def _loglikelihood_single(self, context: str, continuation: str) -> Tuple[float, bool]:
