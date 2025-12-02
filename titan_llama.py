@@ -5,6 +5,8 @@ from typing import Optional, Tuple, Callable
 import math
 from functools import partial
 
+from accelerate import init_empty_weights
+
 from titans_pytorch import (
     MemoryAsContextTransformer,
     NeuralMemory,
@@ -25,7 +27,7 @@ class TitanLLaMAConfig:
     def __init__(
         self,
         vocab_size: int = 32000,
-        hidden_size: int = 4096,
+        hidden_size: int = 2048,
         intermediate_size: int = 11008,
         num_hidden_layers: int = 32,
         num_attention_heads: int = 32,
@@ -38,8 +40,8 @@ class TitanLLaMAConfig:
         num_persist_mem_tokens: int = 4,
         num_longterm_mem_tokens: int = 4,
         neural_memory_layers: Tuple[int, ...] = (8, 16, 24),
-        neural_memory_segment_len: int = 32,
-        neural_memory_batch_size: int = 128,
+        neural_memory_segment_len: int = 16,
+        neural_memory_batch_size: int = 8,
         neural_memory_depth: int = 2,
         use_flex_attn: bool = True,
         sliding_window_attn: bool = True,
@@ -60,7 +62,6 @@ class TitanLLaMAConfig:
         self.max_position_embeddings = max_position_embeddings
         self.rms_norm_eps = rms_norm_eps
         self.rope_theta = rope_theta
-        
         # Titan parameters
         self.segment_len = segment_len
         self.num_persist_mem_tokens = num_persist_mem_tokens
@@ -269,8 +270,8 @@ class TitanLLaMADecoderLayer(nn.Module):
                 model=neural_memory_model,
                 qkv_receives_diff_views=config.neural_mem_qkv_receives_diff_view,
                 accept_weight_residual=False,
+                max_grad_norm=1.0,
             )
-
             # Per-layer memory state (for TTT / long sequences)
             self.memory_state = None
 
@@ -288,27 +289,20 @@ class TitanLLaMADecoderLayer(nn.Module):
 
         residual = hidden_states
 
-<<<<<<< HEAD
-        # Value residual from previous attention layer
-        value_residual: Optional[torch.Tensor] = kwargs.get("value_residual", None)
-
-        # ------------------------------------------------------------------
-        # Neural Memory (before attention)
-        # ------------------------------------------------------------------
-        retrieved_memory: Optional[torch.Tensor] = None
-
-=======
         # Neural Memory processing (before attention)
         retrieved_memory = None
         new_weight_residual = None
         value_residual = kwargs.get('value_residual', None)
         prev_weight_residual = kwargs.get('prev_weight_residual', None)
->>>>>>> 4b1e3eb362cead1b9130ec598be72eae62665a65
         if self.has_neural_memory:
             # QKV-style input: 3 x B x T x D
             memory_input = torch.stack(
                 [hidden_states, hidden_states, hidden_states]
             )
+
+            if not torch.isfinite(hidden_states).all():
+                print(f"[NaN] hidden_states before memory at layer {self.layer_idx}")
+                raise RuntimeError
 
             # NOTE: prev_weights is always None here (no weight-residual path).
             retrieved_memory, self.memory_state = self.neural_memory(
@@ -317,6 +311,13 @@ class TitanLLaMADecoderLayer(nn.Module):
                 prev_weights=None,
             )
 
+            if not torch.isfinite(retrieved_memory).all():
+                print(f"[NaN] retrieved_memory at layer {self.layer_idx}")
+                # optionally inspect state here
+                for k, v in self.memory_state.weights.items():
+                    print(k, torch.isfinite(v).all(), v.min().item(), v.max().item())
+                raise RuntimeError
+
             # If we're not gating, inject memory directly into the residual stream.
             if not self.config.neural_mem_gate_attn_output and retrieved_memory is not None:
                 residual = residual + retrieved_memory
@@ -324,24 +325,11 @@ class TitanLLaMADecoderLayer(nn.Module):
         # ------------------------------------------------------------------
         # Self Attention
         # ------------------------------------------------------------------
-        hidden_states = self.input_layernorm(hidden_states)
-<<<<<<< HEAD
-=======
+        with torch.no_grad():
         
-        hidden_states, self_attn_weights, present_key_value, new_value_residual = self.self_attn(
-            hidden_states=hidden_states,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            past_key_value=past_key_value,
-            output_attentions=output_attentions,
-            use_cache=use_cache,
-            cache_position=cache_position,
-            value_residual=value_residual,
-        )
->>>>>>> 4b1e3eb362cead1b9130ec598be72eae62665a65
-
-        hidden_states, self_attn_weights, present_key_value, new_value_residual = \
-            self.self_attn(
+            hidden_states = self.input_layernorm(hidden_states)
+            
+            hidden_states, self_attn_weights, present_key_value, new_value_residual = self.self_attn(
                 hidden_states=hidden_states,
                 attention_mask=attention_mask,
                 position_ids=position_ids,
@@ -546,7 +534,9 @@ class TitanLLaMAForCausalLM(nn.Module):
             cache_position=cache_position,
         )
 
+
         hidden_states = outputs['last_hidden_state'] if return_dict else outputs[0]
+        # print(f"pre lm-head hidden_states: {hidden_states}")
         logits = self.lm_head(hidden_states)
 
         loss = None
@@ -561,6 +551,7 @@ class TitanLLaMAForCausalLM(nn.Module):
             # Enable model parallelism
             shift_labels = shift_labels.to(shift_logits.device)
             loss = loss_fct(shift_logits, shift_labels)
+            # print("LOSS: ", loss)
 
         if not return_dict:
             output = (logits,) + outputs[1:]
@@ -688,36 +679,29 @@ class TitanLLaMAForCausalLM(nn.Module):
         base_model_name_or_path: str,
         titan_config: Optional[TitanLLaMAConfig] = None,
         freeze_backbone: bool = True,
-        torch_dtype: Optional[torch.dtype] = None,
+        dtype: Optional[torch.dtype] = None,
         device_map: Optional[str] = None,
         **from_pretrained_kwargs,
     ):
-        """
-        Build TitanLLaMA from a pretrained LLaMA checkpoint.
-        The base model is frozen (unless specified otherwise) and only neural memory modules remain trainable.
-        """
-        try:
-            from transformers import AutoModelForCausalLM, AutoConfig
-        except ImportError as exc:
-            raise ImportError("transformers is required to load a pretrained LLaMA backbone") from exc
+        from transformers import AutoModelForCausalLM, AutoConfig
 
         base_cfg = AutoConfig.from_pretrained(base_model_name_or_path, **from_pretrained_kwargs)
 
         titan_kwargs = {}
         if titan_config is not None:
             titan_kwargs = {
-                'segment_len': titan_config.segment_len,
-                'num_persist_mem_tokens': titan_config.num_persist_mem_tokens,
-                'num_longterm_mem_tokens': titan_config.num_longterm_mem_tokens,
-                'neural_memory_layers': titan_config.neural_memory_layers,
-                'neural_memory_segment_len': titan_config.neural_memory_segment_len,
-                'neural_memory_batch_size': titan_config.neural_memory_batch_size,
-                'neural_memory_depth': titan_config.neural_memory_depth,
-                'use_flex_attn': titan_config.use_flex_attn,
-                'sliding_window_attn': titan_config.sliding_window_attn,
-                'neural_mem_gate_attn_output': titan_config.neural_mem_gate_attn_output,
-                'neural_mem_weight_residual': titan_config.neural_mem_weight_residual,
-                'neural_mem_qkv_receives_diff_view': titan_config.neural_mem_qkv_receives_diff_view,
+                "segment_len": titan_config.segment_len,
+                "num_persist_mem_tokens": titan_config.num_persist_mem_tokens,
+                "num_longterm_mem_tokens": titan_config.num_longterm_mem_tokens,
+                "neural_memory_layers": titan_config.neural_memory_layers,
+                "neural_memory_segment_len": titan_config.neural_memory_segment_len,
+                "neural_memory_batch_size": titan_config.neural_memory_batch_size,
+                "neural_memory_depth": titan_config.neural_memory_depth,
+                "use_flex_attn": titan_config.use_flex_attn,
+                "sliding_window_attn": titan_config.sliding_window_attn,
+                "neural_mem_gate_attn_output": titan_config.neural_mem_gate_attn_output,
+                "neural_mem_weight_residual": titan_config.neural_mem_weight_residual,
+                "neural_mem_qkv_receives_diff_view": titan_config.neural_mem_qkv_receives_diff_view,
             }
 
         titan_cfg = TitanLLaMAConfig.from_llama_config(
@@ -728,16 +712,32 @@ class TitanLLaMAForCausalLM(nn.Module):
             **titan_kwargs,
         )
 
-        model = cls(titan_cfg)
+        # If you're on PyTorch ≥ 2.1, you can do:
+        import torch
+        torch.set_default_dtype(torch.bfloat16)
+        torch.set_default_device("cuda")  # all new params go to GPU
 
+        # (Optional) reset defaults if you care about later modules
+        # torch.set_default_device("cpu")
+        # torch.set_default_dtype(torch.float32)
+
+        # -----------------------
+        # 2) Load backbone
+        # -----------------------
         base_model = AutoModelForCausalLM.from_pretrained(
             base_model_name_or_path,
-            torch_dtype=torch_dtype,
-            device_map=device_map,
+            dtype=dtype,
+            device_map=device_map or "cuda",
             **from_pretrained_kwargs,
         )
 
+        model = cls(titan_cfg)
+        model.to(dtype=dtype, device='cuda')
+
         model._load_llama_weights(base_model)
+
+        del base_model
+        torch.cuda.empty_cache()
 
         if freeze_backbone:
             model.freeze_backbone()

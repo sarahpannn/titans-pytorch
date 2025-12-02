@@ -52,7 +52,7 @@ class TrainingConfig:
     num_longterm_mem_tokens: int = 4
     neural_memory_layers: tuple = (4, 8, 12, 16, 20)  # Add memory to multiple layers
     neural_memory_segment_len: int = 64
-    neural_memory_batch_size: int = 128
+    neural_memory_batch_size: int = 64
     neural_memory_depth: int = 2
     use_flex_attn: bool = True
     sliding_window_attn: bool = True
@@ -148,6 +148,8 @@ class SlimPajamaDataset(Dataset):
             streaming=streaming,
             # trust_remote_code=True
         )
+
+        print("Dataset loaded successfully")
         
         # For demonstration, we'll take a subset for the 1B token target
         # In practice, you'd want to configure this based on your compute
@@ -155,7 +157,7 @@ class SlimPajamaDataset(Dataset):
             # Take first portion of the dataset
             self.dataset = self.dataset.take(500000)  # Approximate for 1B tokens
         
-        print("Dataset loaded successfully")
+        print("Done taking from stream")
     
     def __len__(self):
         # For streaming dataset, return a large number
@@ -187,12 +189,21 @@ class SlimPajamaDataset(Dataset):
             
         except Exception as e:
             # Return a dummy batch if there's an error
-            dummy_ids = torch.full((self.max_length,), self.tokenizer.pad_token_id)
+            dummy_ids = torch.full(
+                (self.max_length,),
+                self.tokenizer.pad_token_id,
+                dtype=torch.long,
+                device="cpu",
+            )
             return {
-                'input_ids': dummy_ids,
-                'attention_mask': torch.zeros(self.max_length),
-                'labels': dummy_ids.clone()
-            }
+            'input_ids': dummy_ids,
+            'attention_mask': torch.zeros(
+                self.max_length,
+                dtype=torch.long,
+                device="cpu",
+            ),
+            'labels': dummy_ids.clone(),
+        }
 
 
 def setup_logging(config: TrainingConfig):
@@ -251,10 +262,12 @@ def create_model_and_optimizer(config: TrainingConfig, device):
             base_model_name_or_path=config.base_model_name,
             titan_config=model_config,
             freeze_backbone=config.freeze_backbone,
-        )
+            device_map="cpu",
+            dtype=torch.bfloat16,
+        ).eval()
     else:
         model = TitanLLaMAForCausalLM(model_config)
-    model = model.to(device)
+        # model = model.to(device)
     
     # Align training config with backbone in case it was derived from a pretrained checkpoint
     config.hidden_size = model.model.config.hidden_size
@@ -431,6 +444,11 @@ def main():
             name=config.wandb_run_name,
             config=config.__dict__
         )
+
+    # Create model and optimizer
+    logger.info("Creating model and optimizer...")
+    model, optimizer, scheduler = create_model_and_optimizer(config, device)
+    
     
     # Create datasets
     logger.info("Creating datasets...")
@@ -469,10 +487,6 @@ def main():
         num_workers=2,
         pin_memory=True
     )
-    
-    # Create model and optimizer
-    logger.info("Creating model and optimizer...")
-    model, optimizer, scheduler = create_model_and_optimizer(config, device)
     
     # Resume from checkpoint if specified
     start_step = 0
@@ -514,6 +528,11 @@ def main():
             # Backward pass
             loss.backward()
             epoch_loss += loss.item()
+
+            if wandb and wandb.run:
+                wandb.log({
+                    'train/mini_batch_loss': loss.item(),
+                })
         
         # Gradient clipping
         torch.nn.utils.clip_grad_norm_(model.parameters(), config.grad_clip)

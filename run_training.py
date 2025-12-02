@@ -35,7 +35,7 @@ def parse_args():
     
     # Training configuration
     parser.add_argument("--total_tokens", type=int, default=1_000_000_000, help="Total tokens to train on")
-    parser.add_argument("--batch_size", type=int, default=4, help="Batch size")
+    parser.add_argument("--batch_size", type=int, default=128, help="Batch size")
     parser.add_argument("--micro_batch_size", type=int, default=1, help="Micro batch size")
     parser.add_argument("--sequence_length", type=int, default=2048, help="Sequence length")
     parser.add_argument("--learning_rate", type=float, default=3e-4, help="Learning rate")
