@@ -539,7 +539,7 @@ class TitanLLaMAForCausalLM(nn.Module):
         hidden_states = outputs['last_hidden_state'] if return_dict else outputs[0]
         # print(f"pre lm-head hidden_states: {hidden_states}")
         logits = self.lm_head(hidden_states)
-        correct = 0.0
+        accuracy = None
 
         loss = None
         if labels is not None:
@@ -562,19 +562,28 @@ class TitanLLaMAForCausalLM(nn.Module):
             correct = (predictions == shift_labels) & mask
 
             total_valid_tokens = mask.sum().float()
+            if total_valid_tokens > 0:
+                accuracy = correct.sum().float() / total_valid_tokens
+            else:
+                accuracy = torch.tensor(0.0, device=logits.device)
 
         if not return_dict:
             output = (logits,) + outputs[1:]
             return (loss,) + output if loss is not None else output
 
-        return {
+        result = {
             'loss': loss,
-            'correct': correct.sum().float() / total_valid_tokens,
             'logits': logits,
             'past_key_values': outputs.get('past_key_values'),
             'hidden_states': outputs.get('hidden_states'),
             'attentions': outputs.get('attentions'),
         }
+
+        # Only include accuracy when labels are provided to avoid NameError during generation
+        if accuracy is not None:
+            result['correct'] = accuracy
+
+        return result
 
     def reset_memory_states(self):
         """Reset all neural memory states in the model."""
