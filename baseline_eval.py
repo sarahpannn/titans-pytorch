@@ -37,14 +37,14 @@ DEFAULT_TASKS: Sequence[str] = (
     "mmlu",
     "mmlu_pro",
     "agieval",
-    "commonsenseqa",
+    "commonsense_qa",
     "winogrande",
-    "bbh",
-    "arc_challenge",
-    "triviaqa_wiki",
-    "squad",
-    "quac",
-    "boolq",
+    # "bbh",
+    # "arc_challenge",
+    # "triviaqa_wiki",
+    "squadv2",
+    # "quac",
+    # "boolq",
     "drop",
 )
 
@@ -68,6 +68,8 @@ class TitanSegmentedLM(LM):
         self._batch_size = batch_size
         self._max_gen_toks = max_gen_toks
         self._device = next(model.parameters()).device
+        self._rank = 0
+        self._world_size = 1
 
     @property
     def eot_token_id(self):
@@ -280,8 +282,8 @@ def main() -> None:
     )
     lm = TitanSegmentedLM(model=model, tokenizer=tokenizer, batch_size=args.batch_size, max_gen_toks=args.max_gen_toks)
 
-    task_dict = tasks.get_task_dict(args.tasks, limit=args.limit)
-    results = evaluator.evaluate(lm=lm, task_dict=task_dict, num_fewshot=0)
+    task_dict = tasks.get_task_dict(args.tasks)
+    results = evaluator.evaluate(lm=lm, task_dict=task_dict, limit=args.limit)
 
     summary = extract_primary_metrics(results)
     print("=== Primary metrics (acc_norm/acc_per_char/acc/f1) ===")
