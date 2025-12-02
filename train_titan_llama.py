@@ -577,7 +577,7 @@ def main():
             if wandb and wandb.run:
                 wandb.log({
                     'train/loss': avg_loss,
-                    'train/accuracy': avg_acc,
+                    'train/accuracy': avg_acc / config.gradient_accumulation_steps,
                     'train/learning_rate': lr,
                     'train/step': step,
                     'train/tokens_processed': step * config.tokens_per_batch

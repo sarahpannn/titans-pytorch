@@ -21,6 +21,7 @@ def parse_args():
     parser.add_argument("--hidden_size", type=int, default=2048, help="Hidden size")
     parser.add_argument("--num_layers", type=int, default=22, help="Number of layers")
     parser.add_argument("--num_heads", type=int, default=32, help="Number of attention heads")
+    parser.add_argument("--sliding_window_attn", action="store_true", help="Use SWA")
     
     # Titan-specific
     parser.add_argument("--segment_len", type=int, default=512, help="Segment length for attention")
@@ -80,6 +81,7 @@ def create_config_from_args(args):
         hidden_size=args.hidden_size,
         num_hidden_layers=args.num_layers,
         num_attention_heads=args.num_heads,
+        sliding_window_attn=args.sliding_window_attn,
         
         # Titan config
         segment_len=args.segment_len,

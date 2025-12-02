@@ -502,6 +502,7 @@ class TitanLLaMAForCausalLM(nn.Module):
         self.model = TitanLLaMAModel(config)
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        self.padding_idx = getattr(config, 'pad_token_id', None)
 
     def forward(
         self,
@@ -553,8 +554,14 @@ class TitanLLaMAForCausalLM(nn.Module):
             shift_labels = shift_labels.to(shift_logits.device)
             loss = loss_fct(shift_logits, shift_labels)
             # print("LOSS: ", loss)
+
+            if self.padding_idx is not None: mask = shift_labels != self.padding_idx
+            else: mask = shift_labels != -100
+
             predictions = torch.argmax(shift_logits, dim=-1)
             correct = (predictions == shift_labels) & mask
+
+            total_valid_tokens = mask.sum().float()
 
         if not return_dict:
             output = (logits,) + outputs[1:]
@@ -562,7 +569,7 @@ class TitanLLaMAForCausalLM(nn.Module):
 
         return {
             'loss': loss,
-            'correct', correct.sum().float(),
+            'correct': correct.sum().float() / total_valid_tokens,
             'logits': logits,
             'past_key_values': outputs.get('past_key_values'),
             'hidden_states': outputs.get('hidden_states'),
