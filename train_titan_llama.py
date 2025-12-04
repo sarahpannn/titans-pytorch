@@ -30,6 +30,7 @@ from tqdm import tqdm
 
 # Import our TitanLLaMA implementation
 from titan_llama import TitanLLaMAConfig, TitanLLaMAForCausalLM
+from train_datasets import SlimPajamaDataset
 
 
 @dataclass
@@ -119,91 +120,6 @@ class TrainingConfig:
         if self.wandb_run_name is None:
             self.wandb_run_name = f"{self.model_name}-{int(time.time())}"
 
-
-class SlimPajamaDataset(Dataset):
-    """Dataset class for SlimPajama tokenized data."""
-    
-    def __init__(
-        self, 
-        dataset_name: str = "cerebras/SlimPajama-627B",
-        tokenizer_name: str = "meta-llama/Meta-Llama-3.1-8B", 
-        max_length: int = 2048,
-        streaming: bool = True,
-        split: str = "train",
-        num_proc: int = 8
-    ):
-        self.max_length = max_length
-        self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
-        
-        # Set padding token if not set
-        if self.tokenizer.pad_token is None:
-            self.tokenizer.pad_token = self.tokenizer.eos_token
-            
-        print(f"Loading dataset {dataset_name}...")
-        
-        # Load dataset in streaming mode for large datasets
-        self.dataset = load_dataset(
-            dataset_name,
-            split=split,
-            streaming=streaming,
-            # trust_remote_code=True
-        )
-
-        print("Dataset loaded successfully")
-        
-        # For demonstration, we'll take a subset for the 1B token target
-        # In practice, you'd want to configure this based on your compute
-        if streaming:
-            # Take first portion of the dataset
-            self.dataset = self.dataset.take(500000)  # Approximate for 1B tokens
-        
-        print("Done taking from stream")
-    
-    def __len__(self):
-        # For streaming dataset, return a large number
-        return 1000000  # Approximate
-    
-    def __getitem__(self, idx):
-        try:
-            # Get next item from streaming dataset
-            item = next(iter(self.dataset.skip(idx).take(1)))
-            text = item['text']
-            
-            # Tokenize
-            tokens = self.tokenizer(
-                text,
-                max_length=self.max_length,
-                padding="max_length",
-                truncation=True,
-                return_tensors="pt"
-            )
-            
-            input_ids = tokens['input_ids'].squeeze()
-            attention_mask = tokens['attention_mask'].squeeze()
-            
-            return {
-                'input_ids': input_ids,
-                'attention_mask': attention_mask,
-                'labels': input_ids.clone()
-            }
-            
-        except Exception as e:
-            # Return a dummy batch if there's an error
-            dummy_ids = torch.full(
-                (self.max_length,),
-                self.tokenizer.pad_token_id,
-                dtype=torch.long,
-                device="cpu",
-            )
-            return {
-            'input_ids': dummy_ids,
-            'attention_mask': torch.zeros(
-                self.max_length,
-                dtype=torch.long,
-                device="cpu",
-            ),
-            'labels': dummy_ids.clone(),
-        }
 
 
 def setup_logging(config: TrainingConfig):
@@ -508,6 +424,7 @@ def main():
     model.train()
     running_loss = 0.0
     running_accuracy = 0.0
+    running_ppl = 0.0
     log_steps = 0
     
     data_iter = iter(train_dataloader)
@@ -516,6 +433,7 @@ def main():
         
         epoch_loss = 0.0
         epoch_accuracy = 0.0
+        epoch_ppl = 0.0
         
         # Gradient accumulation loop
         for micro_step in range(config.gradient_accumulation_steps):
@@ -536,13 +454,14 @@ def main():
             # Backward pass
             loss.backward()
             epoch_loss += loss.item()
+            epoch_ppl += outputs['ppl'].item()
             epoch_accuracy += outputs['correct'].item()
 
-            if wandb and wandb.run:
-                wandb.log({
-                    'train/mini_batch_loss': loss.item(),
-                    'train/mini_batch_accuracy': outputs['correct'].item()
-                })
+            # if wandb and wandb.run:
+            #     wandb.log({
+            #         'train/mini_batch_loss': loss.item(),
+            #         'train/mini_batch_accuracy': outputs['correct'].item()
+            #     })
         
         # Gradient clipping
         torch.nn.utils.clip_grad_norm_(model.parameters(), config.grad_clip)
@@ -559,11 +478,13 @@ def main():
         # Logging
         running_loss += epoch_loss
         running_accuracy += epoch_accuracy
+        running_ppl += epoch_ppl
         log_steps += 1
         
         if step % config.log_interval == 0 and is_main_process:
             avg_loss = running_loss / log_steps
             avg_acc = running_accuracy / log_steps
+            avg_ppl = running_ppl / log_steps
             lr = scheduler.get_last_lr()[0]
             
             logger.info(
@@ -577,6 +498,7 @@ def main():
             if wandb and wandb.run:
                 wandb.log({
                     'train/loss': avg_loss,
+                    'train/ppl': avg_ppl / config.gradient_accumulation_steps,
                     'train/accuracy': avg_acc / config.gradient_accumulation_steps,
                     'train/learning_rate': lr,
                     'train/step': step,
@@ -585,6 +507,7 @@ def main():
             
             running_loss = 0.0
             running_accuracy = 0.0
+            running_ppl = 0.0
             log_steps = 0
         
         # Evaluation

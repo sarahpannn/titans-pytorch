@@ -18,6 +18,8 @@ Requires: pip install lm-eval==0.4.2 transformers datasets torch
 import argparse
 import json
 from typing import Iterable, List, Sequence, Tuple
+import tqdm
+from tqdm import tqdm
 
 import torch
 from transformers import AutoConfig, AutoTokenizer
@@ -29,23 +31,24 @@ try:
     from lm_eval.api.model import LM
 except ImportError as exc:  # pragma: no cover - dependency is optional at import time
     raise SystemExit(
-        "lm-eval is required for benchmarking. Install with: pip install lm-eval==0.4.2"
+        "lm-eval is required for benchmarking."
     ) from exc
 
 
+
 DEFAULT_TASKS: Sequence[str] = (
-    "mmlu",
-    "mmlu_pro",
-    "agieval",
-    "commonsense_qa",
-    "winogrande",
+    # "mmlu",
+    # "mmlu_pro",
+    # "agieval",
+    # "commonsense_qa",
+    # "winogrande",
     # "bbh",
     # "arc_challenge",
     # "triviaqa_wiki",
-    "squadv2",
+    "squadv2", # limit 100
     # "quac",
     # "boolq",
-    "drop",
+    # "drop", # limit 100
 )
 
 
@@ -100,7 +103,7 @@ class TitanSegmentedLM(LM):
     # --- LM Eval required methods -------------------------------------------------
     def loglikelihood(self, requests: Iterable) -> List[Tuple[float, bool]]:
         outputs = []
-        for request in requests:
+        for request in tqdm(requests):
             context, continuation = request.args if hasattr(request, "args") else request
             ll, greedy = self._loglikelihood_single(context, continuation)
             outputs.append((ll, greedy))
@@ -139,7 +142,7 @@ class TitanSegmentedLM(LM):
 
     def generate_until(self, requests: Iterable) -> List[str]:
         generations: List[str] = []
-        for request in requests:
+        for request in tqdm(requests):
             context, gen_args = request.args if hasattr(request, "args") else request
             until = gen_args.get("until", []) if isinstance(gen_args, dict) else []
             max_new_tokens = gen_args.get("max_gen_toks", self.max_gen_toks) if isinstance(
@@ -218,8 +221,8 @@ def build_segmented_llama(
     segment_len: int = 512,
     num_persist_mem_tokens: int = 4,
     num_longterm_mem_tokens: int = 4,
-    use_flex_attn: bool = True,
-    sliding_window_attn: bool = True,
+    use_flex_attn: bool = False,
+    sliding_window_attn: bool = False,
     dtype: str = "bfloat16",
 ) -> Tuple[TitanLLaMAForCausalLM, AutoTokenizer]:
     """Load Meta-LLaMA-3.1-8B weights into Titan segmented attention without NMM."""
@@ -256,23 +259,10 @@ def build_segmented_llama(
         titan_config=titan_cfg,
         freeze_backbone=True,
         dtype=torch_dtype,
-        device_map="auto" if device == "cuda" else None,
+        device_map="cuda",
     )
     model.to(device)
     return model, tokenizer
-
-
-def extract_primary_metrics(results: dict) -> dict:
-    """Pull out acc/acc_norm/acc_per_char/f1 for quick comparison."""
-    preferred_keys = ("acc_norm", "acc_per_char", "acc", "f1", "exact_match")
-    summary = {}
-    for task_name, metrics in results.get("results", {}).items():
-        for key in preferred_keys:
-            if key in metrics:
-                summary[task_name] = {key: metrics[key]}
-                break
-    return summary
-
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Benchmark LLaMA 3.1 8B with segmented attention (no NMM).")
@@ -283,6 +273,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--limit", type=int, default=None, help="Optional per-task example limit for a quick smoke test.")
     parser.add_argument("--segment-len", type=int, default=512, help="Segment/window length for segmented attention.")
     parser.add_argument("--dtype", choices=("bfloat16", "float16", "float32"), default="bfloat16", help="Model dtype.")
+    parser.add_argument("--eval_out", type=str, default="baseline_eval.txt", help="Where eval summary saves to.")
+    parser.add_argument("--bootstrap-iters", type=int, default=0, help="Confidence-interval bootstrap iterations (lower to finish faster).")
     return parser.parse_args()
 
 
@@ -296,13 +288,17 @@ def main() -> None:
     lm = TitanSegmentedLM(model=model, tokenizer=tokenizer, batch_size=args.batch_size, max_gen_toks=args.max_gen_toks)
 
     task_dict = tasks.get_task_dict(args.tasks)
-    results = evaluator.evaluate(lm=lm, task_dict=task_dict, limit=args.limit)
+    results = evaluator.evaluate(
+        lm=lm, task_dict=task_dict, 
+        limit=args.limit, 
+        bootstrap_iters=args.bootstrap_iters,
+    )
 
-    summary = extract_primary_metrics(results)
-    print("=== Primary metrics (acc_norm/acc_per_char/acc/f1) ===")
-    print(json.dumps(summary, indent=2))
-    print("\n=== Full lm-eval output ===")
-    print(json.dumps(results, indent=2))
+    with open(args.eval_out, "w") as f:
+        f.write(str(results))
+    
+    # print("\n=== Full lm-eval output ===")
+    # print(json.dumps(results, indent=2))
 
 
 if __name__ == "__main__":

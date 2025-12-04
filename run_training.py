@@ -30,6 +30,7 @@ def parse_args():
     parser.add_argument("--neural_memory_layers", type=str, default="4,8,12,16,20", 
                        help="Comma-separated layer indices for neural memory")
     parser.add_argument("--neural_memory_segment_len", type=int, default=64, help="Neural memory segment length")
+    parser.add_argument("--neural_memory_batch_size", type=int, default=64, help="Batch size for NMM")
     parser.add_argument("--base_model_name", type=str, default="meta-llama/Meta-Llama-3.1-8B", help="Pretrained LLaMA checkpoint for backbone")
     parser.add_argument("--no_pretrained_backbone", action="store_true", help="Train from scratch instead of using a pretrained LLaMA backbone")
     parser.add_argument("--unfreeze_backbone", action="store_true", help="Allow backbone weights to update (default keeps them frozen)")
@@ -88,6 +89,7 @@ def create_config_from_args(args):
         num_persist_mem_tokens=args.num_persist_mem,
         num_longterm_mem_tokens=args.num_longterm_mem,
         neural_memory_layers=neural_memory_layers,
+        neural_memory_batch_size=args.neural_memory_batch_size,
         neural_memory_segment_len=args.neural_memory_segment_len,
         use_pretrained_backbone=not args.no_pretrained_backbone,
         base_model_name=args.base_model_name,

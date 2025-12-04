@@ -25,6 +25,7 @@ from titan_llama import TitanLLaMAConfig, TitanLLaMAForCausalLM
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Benchmark generation throughput for base vs segmented Titan LLaMA variants.")
+    p.add_argument( "--num-trials", type=int, default=3, help="Number of timed runs to average per (variant, generation length).",)
     p.add_argument("--model", default="meta-llama/Meta-Llama-3.1-8B", help="HF base model name/path.")
     p.add_argument("--batch-size", type=int, default=1, help="Batch size for generation prompts.")
     p.add_argument("--nmm-batch-size", type=int, default=64, help="Batch size for neural memory store (defaults to batch-size).")
@@ -32,7 +33,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--prompt-length", type=int, default=4096, help="Target prompt length in tokens; prompt is repeated until reaching this length (use larger values to stress long-context).")
     p.add_argument("--max-new-tokens", type=int, default=128, help="Maximum new tokens to generate per generation call.")
     p.add_argument("--target-new-tokens", type=int, default=1024, help="Total new tokens to generate during timed runs (will loop generation calls until reached).")
-    p.add_argument("--warmup-steps", type=int, default=3, help="Warmup steps before timing.")
+    p.add_argument("--warmup-steps", type=int, default=1, help="Warmup steps before timing.")
     p.add_argument("--temperature", type=float, default=0.0, help="Temperature; 0 disables sampling for greedy decode.")
     p.add_argument("--dtype", choices=("bfloat16", "float16", "float32"), default="bfloat16", help="Computation dtype.")
     p.add_argument("--segment-len", type=int, default=512, help="Segment/window length for segmented attention.")
@@ -177,7 +178,7 @@ def benchmark_single_generation(
                 max_new_tokens=max_new_tokens,
                 do_sample=False,
                 temperature=temperature,
-                use_cache=True,
+                use_cache=False,
             )
     elif hasattr(model, "generate_with_titan_memory"):
         def run_generate(max_new_tokens: int) -> torch.Tensor:
@@ -187,6 +188,7 @@ def benchmark_single_generation(
                 temperature=temperature,
                 do_sample=False,
                 reset_memory=True,
+                use_cache=False,
             )
     else:
         raise ValueError(f"Model {variant_name} has no generation method.")
@@ -292,7 +294,7 @@ def benchmark_generation(
                     max_new_tokens=step_max_new_tokens,
                     do_sample=False,
                     temperature=temperature,
-                    use_cache=True,
+                    use_cache=False,
                 )
         elif hasattr(model, "generate_with_titan_memory"):
             def _run(step_max_new_tokens: int) -> torch.Tensor:
@@ -302,6 +304,7 @@ def benchmark_generation(
                     temperature=temperature,
                     do_sample=False,
                     reset_memory=True,
+                    use_cache=False,
                 )
         else:
             raise ValueError(f"Model {variant_name} has no generation method.")
@@ -451,7 +454,8 @@ def main() -> None:
     print(f"[info] using prompt_length = {prompt_len} tokens")
 
     # Generation lengths to sweep
-    gen_lengths = [64, 128, 256, 512, 1024, 2048]
+    gen_lengths = [16, 32, 64, 128, 256, 512, 1024]
+    # gen_lengths.reverse()
 
     all_results: List[dict] = []
 
@@ -468,83 +472,61 @@ def main() -> None:
             device=device,
         )
 
-        # for gen_len in gen_lengths:
-        #     # Skip if you ever want to cap generation length via CLI
-        #     # (optional; for now we just always run all)
-        #     print(f"\n  -- gen_len = {gen_len} --")
-
-        #     tokens_per_sec, elapsed, generated_tokens, peak_mem_bytes = benchmark_single_generation(
-        #         model=model,
-        #         tokenizer=tokenizer,
-        #         device=device,
-        #         input_ids=input_ids,
-        #         attention_mask=attention_mask,
-        #         max_new_tokens=gen_len,
-        #         target_new_tokens=gen_len,  # single eval-like call
-        #         warmup_steps=args.warmup_steps,
-        #         temperature=args.temperature,
-        #         variant_name=name,
-        #     )
-
-        #     peak_mem_gib = None
-        #     if peak_mem_bytes is not None:
-        #         peak_mem_gib = peak_mem_bytes / (1024 ** 3)
-
-        #     if peak_mem_gib is not None:
-        #         print(
-        #             f"    {name}: {tokens_per_sec:.2f} tok/s | "
-        #             f"{generated_tokens} new tokens in {elapsed:.2f}s "
-        #             f"(prompt_tokens={prompt_tokens}, peak GPU mem={peak_mem_gib:.2f} GiB)"
-        #         )
-        #     else:
-        #         print(
-        #             f"    {name}: {tokens_per_sec:.2f} tok/s | "
-        #             f"{generated_tokens} new tokens in {elapsed:.2f}s "
-        #             f"(prompt_tokens={prompt_tokens})"
-        #         )
-
-        #     all_results.append(
-        #         {
-        #             "variant": name,
-        #             "prompt_length": int(prompt_tokens),
-        #             "gen_len": int(gen_len),
-        #             "tokens_per_sec": float(tokens_per_sec),
-        #             "elapsed": float(elapsed),
-        #             "generated_tokens": int(generated_tokens),
-        #             "peak_mem_bytes": int(peak_mem_bytes) if peak_mem_bytes is not None else None,
-        #             "peak_mem_gib": float(peak_mem_gib) if peak_mem_gib is not None else None,
-        #         }
-        #     )
-
         for gen_len in gen_lengths:
             print(f"\n  -- gen_len = {gen_len} --")
 
-            tokens_per_sec, elapsed, generated_tokens, peak_mem_bytes = benchmark_single_generation(
-                model=model,
-                tokenizer=tokenizer,
-                device=device,
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                gen_len=gen_len,
-                temperature=args.temperature,
-                variant_name=name,
-                do_warmup=True,  # or False if you want raw cold numbers
-            )
+            total_elapsed = 0.0
+            total_new_tokens = 0
+            peak_mem_bytes_list = []
 
+            for i, trial in enumerate(range(args.num_trials)):
+                # Warmup only on the first trial for this (variant, gen_len)
+                do_warmup = (trial == 0)
+
+                tokens_per_sec, elapsed, new_tokens, peak_mem_bytes = benchmark_single_generation(
+                    model=model,
+                    tokenizer=tokenizer,
+                    device=device,
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    gen_len=gen_len,
+                    temperature=args.temperature,
+                    variant_name=name,
+                    do_warmup=do_warmup,
+                )
+
+                total_elapsed += elapsed
+                total_new_tokens += new_tokens
+
+                if peak_mem_bytes is not None:
+                    peak_mem_bytes_list.append(peak_mem_bytes)
+
+                print(f"Done evaluating trial {i + 1}/{args.num_trials}. Running tok/s: {total_new_tokens/total_elapsed}")
+
+            # Aggregate stats over trials
+            if total_elapsed > 0:
+                avg_tokens_per_sec = total_new_tokens / total_elapsed
+            else:
+                avg_tokens_per_sec = float("inf")
+
+            avg_elapsed = total_elapsed / max(args.num_trials, 1)
+            avg_new_tokens = total_new_tokens // max(args.num_trials, 1)
+
+            peak_mem_bytes_agg = max(peak_mem_bytes_list) if peak_mem_bytes_list else None
             peak_mem_gib = None
-            if peak_mem_bytes is not None:
-                peak_mem_gib = peak_mem_bytes / (1024 ** 3)
+            if peak_mem_bytes_agg is not None:
+                peak_mem_gib = peak_mem_bytes_agg / (1024 ** 3)
 
             if peak_mem_gib is not None:
                 print(
-                    f"    {name}: {tokens_per_sec:.2f} tok/s | "
-                    f"{generated_tokens} new tokens in {elapsed:.2f}s "
+                    f"    {name}: {avg_tokens_per_sec:.2f} tok/s (avg over {args.num_trials} trials) | "
+                    f"{avg_new_tokens} new tokens/run, avg elapsed {avg_elapsed:.2f}s "
                     f"(prompt_tokens={prompt_tokens}, peak GPU mem={peak_mem_gib:.2f} GiB)"
                 )
             else:
                 print(
-                    f"    {name}: {tokens_per_sec:.2f} tok/s | "
-                    f"{generated_tokens} new tokens in {elapsed:.2f}s "
+                    f"    {name}: {avg_tokens_per_sec:.2f} tok/s (avg over {args.num_trials} trials) | "
+                    f"{avg_new_tokens} new tokens/run, avg elapsed {avg_elapsed:.2f}s "
                     f"(prompt_tokens={prompt_tokens})"
                 )
 
@@ -553,14 +535,14 @@ def main() -> None:
                     "variant": name,
                     "prompt_length": int(prompt_tokens),
                     "gen_len": int(gen_len),
-                    "tokens_per_sec": float(tokens_per_sec),
-                    "elapsed": float(elapsed),
-                    "generated_tokens": int(generated_tokens),
-                    "peak_mem_bytes": int(peak_mem_bytes) if peak_mem_bytes is not None else None,
+                    "num_trials": int(args.num_trials),
+                    "tokens_per_sec": float(avg_tokens_per_sec),
+                    "avg_elapsed": float(avg_elapsed),
+                    "avg_new_tokens": int(avg_new_tokens),
+                    "peak_mem_bytes": int(peak_mem_bytes_agg) if peak_mem_bytes_agg is not None else None,
                     "peak_mem_gib": float(peak_mem_gib) if peak_mem_gib is not None else None,
                 }
             )
-
 
         # Free model before building the next variant
         del model

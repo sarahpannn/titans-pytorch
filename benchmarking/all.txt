@@ -1,0 +1,4 @@
+commonsenseqa: 0.19000819000819
+winogrande: 0.4964483030781373
+drop: 0.0
+boolq: 0.51
