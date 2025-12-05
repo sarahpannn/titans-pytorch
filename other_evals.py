@@ -37,77 +37,28 @@ def load_titan_from_checkpoint(
     dtype: str = "bfloat16",
 ):
     """
-    Rebuild TitanLLaMAForCausalLM and load weights from the saved checkpoint.
-
-    Expected checkpoint structure:
-
-        checkpoint = {
-            'model_state_dict': model.module.state_dict() if config.use_ddp else model.state_dict(),
-            'config': config.__dict__,
-            'step': step,
-            'loss': loss,
-        }
+    Load TitanLLaMA model using the new from_pretrained method.
+    Much cleaner than the previous implementation.
     """
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    # print("TO DEVICE")
     torch_dtype = {
         "bfloat16": torch.bfloat16,
         "float16": torch.float16,
         "float32": torch.float32,
     }[dtype]
 
-    # 1) Load checkpoint
-    ckpt = torch.load(checkpoint_path, map_location=device)
-    state_dict = ckpt["model_state_dict"]
-    train_cfg = ckpt.get("config", {}) or {}
-
-    print('checkpoint done')
-    # 2) Base HF config (for d_model, num_layers, etc.)
-    base_cfg = AutoConfig.from_pretrained(base_model_name)
-
-    # 3) Titan-specific overrides from training config when available
-    def _get(name, default):
-        return train_cfg.get(name, default)
-
-    nm_layers = _get("neural_memory_layers", (8, 16, 24))
-    if isinstance(nm_layers, list):
-        nm_layers = tuple(nm_layers)
-
-    titan_cfg = TitanLLaMAConfig.from_llama_config(
-        base_cfg,
-        segment_len=_get("segment_len", 512),
-        num_persist_mem_tokens=_get("num_persist_mem_tokens", 4),
-        num_longterm_mem_tokens=_get("num_longterm_mem_tokens", 4),
-        neural_memory_layers=nm_layers,
-        neural_memory_segment_len=_get("neural_memory_segment_len", 16),
-        neural_memory_batch_size=_get("neural_memory_batch_size", 8),
-        neural_memory_depth=_get("neural_memory_depth", 2),
-        use_flex_attn=_get("use_flex_attn", True),
-        sliding_window_attn=_get("sliding_window_attn", True),
-        neural_mem_gate_attn_output=_get("neural_mem_gate_attn_output", False),
-        neural_mem_weight_residual=_get("neural_mem_weight_residual", True),
-        neural_mem_qkv_receives_diff_view=_get("neural_mem_qkv_receives_diff_view", True),
-        use_pretrained_backbone=False,      # we load *all* weights from ckpt
+    print('loading checkpoint...')
+    
+    # Use the new from_pretrained method
+    model = TitanLLaMAForCausalLM.from_pretrained(
+        checkpoint_path=checkpoint_path,
         base_model_name_or_path=base_model_name,
-        freeze_backbone=True,
+        dtype=torch_dtype,
+        strict=False,
     )
 
-    print('loading titan model class')
+    print('done loading titan model')
 
-    # 4) Instantiate Titan model and load weights
-    model = TitanLLaMAForCausalLM(titan_cfg)
-    load_info = model.load_state_dict(state_dict, strict=False)
-
-    print('done loading titan model class')
-
-    if load_info.missing_keys:
-        print("[load_titan_from_checkpoint] Missing keys:", load_info.missing_keys)
-    if load_info.unexpected_keys:
-        print("[load_titan_from_checkpoint] Unexpected keys:", load_info.unexpected_keys)
-
-    model.to(dtype=torch_dtype)
-
-    # 5) Tokenizer from base HF model
+    # Tokenizer from base HF model
     tokenizer = AutoTokenizer.from_pretrained(base_model_name)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
