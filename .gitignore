@@ -178,3 +178,7 @@ wandb/
 benchmarking/baseline_eval.txt
 benchmarking/speed_eval_results_memory.png
 benchmarking/speed_eval_results_throughput.png
+
+lazy.sh
+
+*.pt
