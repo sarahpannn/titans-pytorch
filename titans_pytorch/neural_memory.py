@@ -802,7 +802,20 @@ class NeuralMemory(Module):
 
         next_state = (next_last_update, next_last_momentum)
 
-        next_store_state = NeuralMemState(next_seq_len_index, weights, remainder, next_state, updates)
+        compressed_updates = TensorDict({
+            name: upd[:, -1:].contiguous()
+            for name, upd in updates.items()
+        })
+
+        next_store_state = NeuralMemState(
+            next_seq_len_index,
+            weights,
+            remainder,
+            next_state,
+            compressed_updates,
+        )
+
+        # next_store_state = NeuralMemState(next_seq_len_index, weights, remainder, next_state, updates)
 
         # return updates to neural memory at all chunked timesteps + neural mem cache / state to be fed back
 
@@ -979,10 +992,19 @@ class NeuralMemory(Module):
         updates = None
 
         def accum_updates(past_updates, future_updates):
-            if not exists(past_updates):
-                return future_updates
+            # if not exists(past_updates):
+            #     return future_updates
+            if not exists(future_updates):
+                return past_updates
 
-            return TensorDict({param_name: cat((past_update[:, :-1], future_update), dim = 1) for (param_name, past_update), (_, future_update) in zip(past_updates.items(), future_updates.items())})
+            return TensorDict({
+                name: upd[:, -1:].contiguous()
+                for name, upd in future_updates.items()
+            })
+
+            # return TensorDict({
+            #     param_name: cat((past_update[:, :-1], future_update), dim = 1) 
+            #     for (param_name, past_update), (_, future_update) in zip(past_updates.items(), future_updates.items())})
 
         # loop through chunks of store sequences
 

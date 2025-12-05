@@ -30,7 +30,8 @@ from tqdm import tqdm
 
 # Import our TitanLLaMA implementation
 from titan_llama import TitanLLaMAConfig, TitanLLaMAForCausalLM
-from train_datasets import SlimPajamaDataset
+from train_datasets import SlimPajamaDataset, FineWebEduDataset
+from cuda_utils import log_cuda_mem
 
 
 @dataclass
@@ -56,7 +57,7 @@ class TrainingConfig:
     neural_memory_batch_size: int = 64
     neural_memory_depth: int = 2
     use_flex_attn: bool = True
-    sliding_window_attn: bool = True
+    sliding_window_attn: bool = False
     neural_mem_gate_attn_output: bool = False
     neural_mem_weight_residual: bool = True
     
@@ -205,13 +206,43 @@ def create_model_and_optimizer(config: TrainingConfig, device):
     neural_memory_params = []
     regular_params = []
     
-    for name, param in model.named_parameters():
-        if not param.requires_grad:
+    from collections import defaultdict
+    bucket_counts = defaultdict(int)
+
+    for name, p in model.named_parameters():
+        if not p.requires_grad:
             continue
-        if 'neural_memory' in name:
-            neural_memory_params.append(param)
+        if "neural_memory.memory_model_parameters" in name:
+            bucket_counts["nm_inner_model"] += p.numel()
+        elif any(x in name for x in [".to_keys", ".to_values", ".to_adaptive_step",
+                                    ".to_momentum", ".to_decay_factor",
+                                    ".to_layer_modulation", ".to_learned_weight_residual_mix"]):
+            bucket_counts["nm_write_side"] += p.numel()
+        elif "neural_memory" in name:
+            bucket_counts["nm_read_side"] += p.numel()
+        elif "persistent_memory" in name:
+            bucket_counts["persistent_memory"] += p.numel()
         else:
-            regular_params.append(param)
+            bucket_counts["other"] += p.numel()
+
+        print("\n[create_model_and_optimizer] Trainable param breakdown:")
+        for k, v in bucket_counts.items():
+            print(f"  - {k:18s}: {v:,} ({v/1e6:.2f}M)")
+
+        # Separate neural memory parameters for different optimization
+        neural_memory_params = []
+        regular_params = []
+
+        for name, param in model.named_parameters():
+            if not param.requires_grad:
+                continue
+            if 'neural_memory' in name:
+                neural_memory_params.append(param)
+            else:
+                regular_params.append(param)
+
+        print(f"\n[create_model_and_optimizer] #trainable nm params: {sum(p.numel() for p in neural_memory_params):,}")
+        print(f"[create_model_and_optimizer] #trainable non-nm params: {sum(p.numel() for p in regular_params):,}\n")
     
     # Create optimizers
     optimizer_groups = []
@@ -237,13 +268,29 @@ def create_model_and_optimizer(config: TrainingConfig, device):
         raise ValueError("No trainable parameters were found. Ensure backbone freezing is configured correctly.")
 
     optimizer = AdamW(optimizer_groups)
-    
-    # Learning rate scheduler
-    scheduler = CosineAnnealingLR(
+
+    warmup_steps = int(config.total_steps * 0.1)
+    decay_steps = config.total_steps - warmup_steps
+
+    warmup_scheduler = LinearLR(
         optimizer, 
-        T_max=config.total_steps,
+        start_factor=1e-10,
+        end_factor=1.0,
+        total_iters=warmup_steps
+    )
+
+    cosine_scheduler = CosineAnnealingLR(
+        optimizer, 
+        T_max=decay_steps, 
         eta_min=config.min_learning_rate
     )
+
+    scheduler = SequentialLR(
+        optimizer, 
+        schedulers=[warmup_scheduler, cosine_scheduler], 
+        milestones=[warmup_steps]
+    )
+    
     
     # Wrap with DDP if using distributed training
     if config.use_ddp:
@@ -266,21 +313,21 @@ def save_checkpoint(
     
     checkpoint = {
         'model_state_dict': model.module.state_dict() if config.use_ddp else model.state_dict(),
-        'optimizer_state_dict': optimizer.state_dict(),
-        'scheduler_state_dict': scheduler.state_dict(),
+        # 'optimizer_state_dict': optimizer.state_dict(),
+        # 'scheduler_state_dict': scheduler.state_dict(),
         'config': config.__dict__,
         'step': step,
         'loss': loss,
     }
     
     # Save regular checkpoint
-    checkpoint_path = os.path.join(config.output_dir, f"checkpoint-{step}.pt")
-    torch.save(checkpoint, checkpoint_path)
+    # checkpoint_path = os.path.join(config.output_dir, f"checkpoint-{step}.pt")
+    # torch.save(checkpoint, checkpoint_path)
     
-    # Save best checkpoint
-    if is_best:
-        best_path = os.path.join(config.output_dir, "best_checkpoint.pt")
-        torch.save(checkpoint, best_path)
+    # # Save best checkpoint
+    # if is_best:
+    #     best_path = os.path.join(config.output_dir, "best_checkpoint.pt")
+    #     torch.save(checkpoint, best_path)
     
     # Save latest checkpoint
     latest_path = os.path.join(config.output_dir, "latest_checkpoint.pt")
@@ -295,7 +342,7 @@ def load_checkpoint(model, optimizer, scheduler, checkpoint_path: str):
     checkpoint = torch.load(checkpoint_path, map_location='cpu')
     
     model.load_state_dict(checkpoint['model_state_dict'])
-    optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+    # optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
     scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
     
     return checkpoint['step'], checkpoint['loss']
@@ -315,6 +362,9 @@ def evaluate_model(model, eval_dataloader, device, max_eval_steps=100):
                 
             input_ids = batch['input_ids'].to(device)
             labels = batch['labels'].to(device)
+
+            if len(input_ids.shape) == 1: input_ids = input_ids.unsqueeze(0)
+            if len(labels.shape) == 1: labels = labels.unsqueeze(0)
             
             # Reset memory states for each eval batch
             model.reset_memory_states()
@@ -374,24 +424,48 @@ def main():
     
     # Create datasets
     logger.info("Creating datasets...")
-    train_dataset = SlimPajamaDataset(
-        dataset_name=config.dataset_name,
-        tokenizer_name=config.tokenizer_name,
-        max_length=config.sequence_length,
-        streaming=True,
-        split="train",
-        num_proc=config.num_proc
-    )
+
+    if 'pajama' in config.dataset_name:
+        train_dataset = SlimPajamaDataset(
+            dataset_name=config.dataset_name,
+            tokenizer_name=config.tokenizer_name,
+            max_length=config.sequence_length,
+            streaming=True,
+            split="train",
+            num_proc=config.num_proc
+        )
+        
+        # For validation, we'll use a small subset
+        eval_dataset = SlimPajamaDataset(
+            dataset_name=config.dataset_name,
+            tokenizer_name=config.tokenizer_name,
+            max_length=config.sequence_length,
+            streaming=True,
+            split="validation" if "validation" in ["train"] else "train",  # Use train split for now
+            num_proc=config.num_proc
+        )
     
-    # For validation, we'll use a small subset
-    eval_dataset = SlimPajamaDataset(
-        dataset_name=config.dataset_name,
-        tokenizer_name=config.tokenizer_name,
-        max_length=config.sequence_length,
-        streaming=True,
-        split="validation" if "validation" in ["train"] else "train",  # Use train split for now
-        num_proc=config.num_proc
-    )
+    elif 'fineweb' in config.dataset_name:
+        train_dataset = FineWebEduDataset(
+            dataset_name=config.dataset_name,
+            tokenizer_name=config.tokenizer_name,
+            max_length=config.sequence_length,
+            streaming=True,
+            split="train",
+            num_proc=config.num_proc,
+        )
+        
+        # For validation, we'll use a small subset
+        eval_dataset = FineWebEduDataset(
+            dataset_name=config.dataset_name,
+            tokenizer_name=config.tokenizer_name,
+            max_length=config.sequence_length,
+            streaming=True,
+            split="validation" if "validation" in ["train"] else "train",  # Use train split for now
+            num_proc=config.num_proc,
+        )
+
+    else: raise RuntimeError("Could not infer dataset")
     
     # Create data loaders
     train_dataloader = DataLoader(
@@ -428,9 +502,15 @@ def main():
     log_steps = 0
     
     data_iter = iter(train_dataloader)
+
+    if torch.cuda.is_available():
+        torch.cuda.reset_peak_memory_stats()
+        log_cuda_mem("start")
     
     for step in tqdm(range(start_step, config.total_steps), desc="Training", disable=not is_main_process):
-        
+        # if step == 0:  # just log for the first step
+        #     log_cuda_mem("before forward")
+
         epoch_loss = 0.0
         epoch_accuracy = 0.0
         epoch_ppl = 0.0
@@ -445,11 +525,16 @@ def main():
                 batch = next(data_iter)
             
             input_ids = batch['input_ids'].to(device)
-            labels = batch['labels'].to(device)
+            if len(input_ids.shape) == 1: input_ids = input_ids.unsqueeze(0)
+            labels = batch['labels'].to(device) 
+            if len(labels.shape) == 1: labels = labels.unsqueeze(0)
             
             # Forward pass
             outputs = model(input_ids=input_ids, labels=labels)
             loss = outputs['loss'] / config.gradient_accumulation_steps
+
+            # if step == 0:
+            #     log_cuda_mem("after forward")
             
             # Backward pass
             loss.backward()
@@ -457,11 +542,8 @@ def main():
             epoch_ppl += outputs['ppl'].item()
             epoch_accuracy += outputs['correct'].item()
 
-            # if wandb and wandb.run:
-            #     wandb.log({
-            #         'train/mini_batch_loss': loss.item(),
-            #         'train/mini_batch_accuracy': outputs['correct'].item()
-            #     })
+            # if step == 0:
+            #     log_cuda_mem("after backward")
         
         # Gradient clipping
         torch.nn.utils.clip_grad_norm_(model.parameters(), config.grad_clip)
@@ -470,6 +552,11 @@ def main():
         optimizer.step()
         scheduler.step()
         optimizer.zero_grad()
+
+        # if step == 0:
+        #     log_cuda_mem("after optimizer.step")
+        #     print("[CUDA] peak allocated:", torch.cuda.max_memory_allocated()/1024**3, "GiB")
+        #     break
         
         # Reset memory states periodically to prevent memory leaks
         if step % 100 == 0:

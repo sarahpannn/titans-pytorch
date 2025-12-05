@@ -4,5 +4,6 @@ python3 run_training.py \
     --log_interval 1 \
     --batch_size 32 \
     --neural_memory_segment_len 64 \
-    --neural_memory_batch_size 64
+    --neural_memory_batch_size 64 \
+    --no_wandb
     
