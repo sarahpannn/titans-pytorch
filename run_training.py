@@ -57,6 +57,11 @@ def parse_args():
     parser.add_argument("--save_interval", type=int, default=5000, help="Save interval")
     parser.add_argument("--log_interval", type=int, default=100, help="Log interval")
     
+    # Intermittent evaluation during training
+    parser.add_argument("--intermittent_eval_frequency", type=int, default=15, help="Evaluate every N steps during training")
+    parser.add_argument("--intermittent_eval_limit", type=int, default=200, help="Number of questions to test in intermittent eval")
+    parser.add_argument("--intermittent_eval_start_step", type=int, default=50, help="Start intermittent eval after N steps")
+    
     # Distributed training
     parser.add_argument("--use_ddp", action="store_true", help="Use distributed training")
     
@@ -116,6 +121,9 @@ def create_config_from_args(args):
         eval_interval=args.eval_interval,
         save_interval=args.save_interval,
         log_interval=args.log_interval,
+        intermittent_eval_frequency=args.intermittent_eval_frequency,
+        intermittent_eval_limit=args.intermittent_eval_limit,
+        intermittent_eval_start_step=args.intermittent_eval_start_step,
         
         # Distributed config
         use_ddp=args.use_ddp,

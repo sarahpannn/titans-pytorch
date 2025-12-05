@@ -18,7 +18,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 from torch.optim import AdamW
-from torch.optim.lr_scheduler import CosineAnnealingLR
+from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 
@@ -32,6 +32,7 @@ from tqdm import tqdm
 from titan_llama import TitanLLaMAConfig, TitanLLaMAForCausalLM
 from train_datasets import SlimPajamaDataset, FineWebEduDataset
 from cuda_utils import log_cuda_mem
+from eval_during_training import quick_eval_boolq, should_run_intermittent_eval, log_eval_metrics
 
 
 @dataclass
@@ -84,6 +85,11 @@ class TrainingConfig:
     eval_interval: int = 1000
     save_interval: int = 5000
     log_interval: int = 100
+    
+    # Intermittent evaluation during training
+    intermittent_eval_frequency: int = 15  # Evaluate every 15 steps
+    intermittent_eval_limit: int = 200     # Test on 200 BoolQ questions
+    intermittent_eval_start_step: int = 50  # Start evaluating after 50 steps
     
     # Data
     dataset_name: str = "cerebras/SlimPajama-627B"
@@ -333,7 +339,7 @@ def save_checkpoint(
     latest_path = os.path.join(config.output_dir, "latest_checkpoint.pt")
     torch.save(checkpoint, latest_path)
     
-    print(f"Checkpoint saved: {checkpoint_path}")
+    print(f"Checkpoint saved: {latest_path}")
 
 
 def load_checkpoint(model, optimizer, scheduler, checkpoint_path: str):
@@ -420,6 +426,11 @@ def main():
     # Create model and optimizer
     logger.info("Creating model and optimizer...")
     model, optimizer, scheduler = create_model_and_optimizer(config, device)
+    
+    # Create tokenizer for evaluation
+    tokenizer = AutoTokenizer.from_pretrained(config.tokenizer_name)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
     
     
     # Create datasets
@@ -620,6 +631,22 @@ def main():
             
             if step % config.save_interval == 0:
                 save_checkpoint(model, optimizer, scheduler, config, step, eval_loss, is_best)
+        
+        # Intermittent evaluation on BoolQ
+        if should_run_intermittent_eval(step, config.intermittent_eval_frequency, config.intermittent_eval_start_step) and is_main_process:
+            logger.info(f"Running intermittent BoolQ evaluation at step {step}...")
+            eval_metrics = quick_eval_boolq(
+                model=model,
+                tokenizer=tokenizer,
+                limit=config.intermittent_eval_limit,
+                batch_size=1,
+                max_gen_toks=32,
+                device=device
+            )
+            log_eval_metrics(eval_metrics, step, logger, wandb)
+            
+            # Reset memory after evaluation to ensure clean training state
+            model.reset_memory_states()
         
         # Regular checkpointing
         elif step % config.save_interval == 0 and step > 0 and is_main_process:
