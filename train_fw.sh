@@ -9,7 +9,10 @@ python3 run_training.py \
     --micro_batch_size 256 \
     --neural_memory_segment_len 64 \
     --neural_memory_batch_size 64 \
-    --total_tokens 100000000
+    --total_tokens 100000000 \
+    --intermittent_eval_frequency 15 \
+    --intermittent_eval_limit 200 \
+    --intermittent_eval_start_step 50
     
 
 python3 other_evals.py \
