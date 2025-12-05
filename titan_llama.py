@@ -343,7 +343,7 @@ class TitanLLaMADecoderLayer(nn.Module):
 
         else: 
             hidden_states = self.input_layernorm(hidden_states)
-                
+            
             hidden_states, self_attn_weights, present_key_value, new_value_residual = self.self_attn(
                 hidden_states=hidden_states,
                 attention_mask=attention_mask,
@@ -589,7 +589,7 @@ class TitanLLaMAForCausalLM(nn.Module):
 
         result = {
             'loss': loss,
-            'ppl': ppl,
+            'ppl': ppl if labels is not None else None,
             'logits': logits,
             'past_key_values': outputs.get('past_key_values'),
             'hidden_states': outputs.get('hidden_states'),
@@ -829,15 +829,48 @@ class TitanLLaMAForCausalLM(nn.Module):
                 titan_layer.mlp.down_proj.weight.copy_(llama_layer.mlp.down_proj.weight)
 
     def freeze_backbone(self):
-        """Freeze pretrained backbone weights while keeping neural memory (and persistent memories) trainable."""
+        """
+        Freeze pretrained backbone weights.
+        Keep only the NeuralMemory *read-side adapter* trainable:
+        - to_queries, multihead_rmsnorm, retrieve_gate, combine_heads, etc.
+        """
+
+        keys_to_freeze = [
+            "memory_model_parameters",   # inner MLP weights
+            ".to_keys",                  # write-side projections
+            ".to_values",
+            ".to_adaptive_step",
+            ".to_momentum",
+            ".to_decay_factor",
+            ".to_layer_modulation",
+            ".to_learned_weight_residual_mix",
+        ]
+
+        nm_total = 0
+        nm_frozen = 0
+
+        print("\n[freeze_backbone] ***** BEGIN *****")
+
         for name, param in self.named_parameters():
-            # keep neural memory trainable
-            if 'neural_memory' in name:
+            # persistent memory always trainable
+            if "persistent_memory" in name:
+                param.requires_grad = True
                 continue
 
-            # allow segmented attention persistent memory to remain trainable
-            if 'persistent_memory' in name:
+            if "neural_memory" in name:
+                nm_total += param.numel()
+
+                if any(k in name for k in keys_to_freeze):
+                    param.requires_grad = False
+                    nm_frozen += param.numel()
+                else:
+                    param.requires_grad = True
                 continue
 
-            # freeze everything else
+            # everything else = backbone → frozen
             param.requires_grad = False
+
+        print(f"[freeze_backbone] NM total params:  {nm_total:,}")
+        print(f"[freeze_backbone] NM frozen params: {nm_frozen:,}")
+        print(f"[freeze_backbone] NM trainable:     {nm_total - nm_frozen:,}")
+        print("[freeze_backbone] ***** END *****\n")

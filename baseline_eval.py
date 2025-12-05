@@ -41,11 +41,11 @@ DEFAULT_TASKS: Sequence[str] = (
     # "mmlu_pro",
     # "agieval",
     # "commonsense_qa",
-    # "winogrande",
+    "winogrande",
     # "bbh",
     # "arc_challenge",
     # "triviaqa_wiki",
-    "squadv2", # limit 100
+    # "squadv2", # limit 100
     # "quac",
     # "boolq",
     # "drop", # limit 100
