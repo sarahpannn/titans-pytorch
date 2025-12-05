@@ -725,6 +725,76 @@ class TitanLLaMAForCausalLM(nn.Module):
         return weight.repeat_interleave(repeat_factor, dim=0)
 
     @classmethod
+    def from_pretrained(
+        cls,
+        checkpoint_path: str,
+        base_model_name_or_path: str = "meta-llama/Meta-Llama-3.1-8B",
+        dtype: Optional[torch.dtype] = None,
+        device: Optional[str] = None,
+        strict: bool = False,
+    ):
+        """
+        Load a TitanLLaMA model directly from a saved checkpoint.
+        
+        Args:
+            checkpoint_path: Path to the checkpoint file
+            base_model_name_or_path: Base HF model name for config/tokenizer
+            dtype: Model dtype (defaults to bfloat16)
+            device: Device to load model on (defaults to cuda if available)
+            strict: Whether to strictly match state dict keys
+        """
+        device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+        dtype = dtype or torch.bfloat16
+        
+        # Load checkpoint
+        ckpt = torch.load(checkpoint_path, map_location=device)
+        state_dict = ckpt["model_state_dict"]
+        train_cfg = ckpt.get("config", {}) or {}
+        
+        # Get base config
+        from transformers import AutoConfig
+        base_cfg = AutoConfig.from_pretrained(base_model_name_or_path)
+        
+        # Reconstruct Titan config from training config
+        def _get(name, default):
+            return train_cfg.get(name, default)
+        
+        nm_layers = _get("neural_memory_layers", (8, 16, 24))
+        if isinstance(nm_layers, list):
+            nm_layers = tuple(nm_layers)
+        
+        titan_cfg = TitanLLaMAConfig.from_llama_config(
+            base_cfg,
+            segment_len=_get("segment_len", 512),
+            num_persist_mem_tokens=_get("num_persist_mem_tokens", 4),
+            num_longterm_mem_tokens=_get("num_longterm_mem_tokens", 4),
+            neural_memory_layers=nm_layers,
+            neural_memory_segment_len=_get("neural_memory_segment_len", 16),
+            neural_memory_batch_size=_get("neural_memory_batch_size", 8),
+            neural_memory_depth=_get("neural_memory_depth", 2),
+            use_flex_attn=_get("use_flex_attn", True),
+            sliding_window_attn=_get("sliding_window_attn", True),
+            neural_mem_gate_attn_output=_get("neural_mem_gate_attn_output", False),
+            neural_mem_weight_residual=_get("neural_mem_weight_residual", True),
+            neural_mem_qkv_receives_diff_view=_get("neural_mem_qkv_receives_diff_view", True),
+            use_pretrained_backbone=False,
+            base_model_name_or_path=base_model_name_or_path,
+            freeze_backbone=True,
+        )
+        
+        # Create model and load weights
+        model = cls(titan_cfg)
+        load_info = model.load_state_dict(state_dict, strict=strict)
+        
+        if load_info.missing_keys:
+            print(f"[from_pretrained] Missing keys: {load_info.missing_keys}")
+        if load_info.unexpected_keys:
+            print(f"[from_pretrained] Unexpected keys: {load_info.unexpected_keys}")
+        
+        model.to(dtype=dtype, device=device)
+        return model
+
+    @classmethod
     def from_pretrained_llama(
         cls,
         base_model_name_or_path: str,
