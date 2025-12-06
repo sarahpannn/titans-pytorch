@@ -1,4 +1,4 @@
-CUDA_VISIBLE_DEVICES=0 python3 run_training.py \
+CUDA_LAUNCH_BLOCKING=1 CUDA_VISIBLE_DEVICES=0 python3 run_training.py \
     --dataset_name HuggingFaceFW/fineweb-edu \
     --segment_len 512 \
     --sequence_length 8192 \
