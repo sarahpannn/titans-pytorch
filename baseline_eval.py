@@ -71,8 +71,10 @@ class TitanSegmentedLM(LM):
         self._batch_size = batch_size
         self._max_gen_toks = max_gen_toks
         self._device = next(model.parameters()).device
-        self._rank = 0
-        self._world_size = 1
+        # Get actual distributed environment if available
+        import os
+        self._rank = int(os.environ.get('RANK', 0))
+        self._world_size = int(os.environ.get('WORLD_SIZE', 1))
 
     @property
     def eot_token_id(self):

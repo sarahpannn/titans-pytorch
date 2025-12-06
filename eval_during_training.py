@@ -56,6 +56,12 @@ def quick_eval_boolq(
         eval_model = eval_model.to(device)
     
     # Wrap model for LM evaluation
+    # Note: Only run evaluation on rank 0 to avoid distributed conflicts
+    import os
+    current_rank = int(os.environ.get('RANK', 0))
+    if current_rank != 0:
+        return {"error": "Evaluation should only run on rank 0"}
+    
     lm = TitanSegmentedLM(
         model=eval_model,
         tokenizer=tokenizer,
@@ -152,6 +158,12 @@ def quick_eval_multiple_tasks(
     # Ensure model is on correct device
     if device is not None:
         eval_model = eval_model.to(device)
+    
+    # Note: Only run evaluation on rank 0 to avoid distributed conflicts
+    import os
+    current_rank = int(os.environ.get('RANK', 0))
+    if current_rank != 0:
+        return {"error": "Evaluation should only run on rank 0"}
     
     # Wrap model for LM evaluation  
     lm = TitanSegmentedLM(
