@@ -100,8 +100,18 @@ class TitanSegmentedLM(LM):
     def tok_decode(self, tokens: List[int]) -> str:
         return self.tokenizer.decode(tokens, skip_special_tokens=True)
 
+    def _reset_memory_states(self):
+        """Reset model memory states to prevent memory corruption."""
+        try:
+            if hasattr(self.model, 'reset_memory_states'):
+                self.model.reset_memory_states()
+            torch.cuda.empty_cache()
+        except Exception:
+            pass  # Graceful degradation if reset fails
+
     # --- LM Eval required methods -------------------------------------------------
     def loglikelihood(self, requests: Iterable) -> List[Tuple[float, bool]]:
+        self._reset_memory_states()  # Reset memory before evaluation
         outputs = []
         for request in tqdm(requests):
             context, continuation = request.args if hasattr(request, "args") else request
@@ -110,6 +120,7 @@ class TitanSegmentedLM(LM):
         return outputs
 
     def loglikelihood_rolling(self, requests: Iterable) -> List[Tuple[float, bool]]:
+        self._reset_memory_states()  # Reset memory before evaluation
         results: List[Tuple[float, bool]] = []
         stride = self.max_length - 1
         for request in requests:
@@ -141,6 +152,7 @@ class TitanSegmentedLM(LM):
         return results
 
     def generate_until(self, requests: Iterable) -> List[str]:
+        self._reset_memory_states()  # Reset memory before evaluation
         generations: List[str] = []
         for request in tqdm(requests):
             context, gen_args = request.args if hasattr(request, "args") else request
@@ -159,6 +171,13 @@ class TitanSegmentedLM(LM):
 
     def _greedy_generate(self, inputs: dict, max_new_tokens: int, stop_tokens: Sequence[str]) -> str:
         """Lightweight greedy decode since TitanLLaMAForCausalLM lacks HF .generate()."""
+        # Reset memory states before generation
+        try:
+            if hasattr(self.model, 'reset_memory_states'):
+                self.model.reset_memory_states()
+        except Exception:
+            pass
+            
         input_ids = inputs["input_ids"]
         attention_mask = inputs.get("attention_mask", torch.ones_like(input_ids, device=self.device))
         generated = input_ids
@@ -186,6 +205,13 @@ class TitanSegmentedLM(LM):
 
     # --- Helpers ------------------------------------------------------------------
     def _loglikelihood_single(self, context: str, continuation: str) -> Tuple[float, bool]:
+        # Reset memory states for each request to prevent corruption
+        try:
+            if hasattr(self.model, 'reset_memory_states'):
+                self.model.reset_memory_states()
+        except Exception:
+            pass
+            
         context_ids = self.tok_encode(context)
         continuation_ids = self.tok_encode(continuation)
         if not context_ids:

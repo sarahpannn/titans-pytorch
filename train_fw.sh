@@ -1,6 +1,4 @@
-export CUDA_VISIBLE_DEVICES=0
-
-python3 run_training.py \
+CUDA_VISIBLE_DEVICES=0 python3 run_training.py \
     --dataset_name HuggingFaceFW/fineweb-edu \
     --segment_len 512 \
     --sequence_length 8192 \
@@ -10,11 +8,11 @@ python3 run_training.py \
     --neural_memory_segment_len 64 \
     --neural_memory_batch_size 64 \
     --total_tokens 100000000 \
-    --intermittent_eval_frequency 15 \
-    --intermittent_eval_limit 200 \
-    --intermittent_eval_start_step 50
+    --intermittent_eval_frequency 100 \
+    --intermittent_eval_limit 50 \
+    --intermittent_eval_start_step 200
     
 
-python3 other_evals.py \
+CUDA_VISIBLE_DEVICES=0 python3 other_evals.py \
     --checkpoint titan_llama_checkpoints/latest_checkpoint.pt \
     --limit 10
