@@ -58,9 +58,26 @@ def quick_eval_boolq_subprocess(
         
     # Save model state dict
     eval_model = model.module if hasattr(model, 'module') else model
+    
+    # Convert config to dict safely
+    if hasattr(eval_model.config, '__dict__'):
+        config_dict = eval_model.config.__dict__.copy()
+    else:
+        config_dict = dict(eval_model.config)
+    
+    # Ensure all config values are serializable
+    serializable_config = {}
+    for key, value in config_dict.items():
+        if isinstance(value, (str, int, float, bool, type(None), list, tuple)):
+            serializable_config[key] = value
+        elif hasattr(value, '__dict__'):
+            serializable_config[key] = value.__dict__ if hasattr(value, '__dict__') else str(value)
+        else:
+            serializable_config[key] = str(value)
+    
     torch.save({
         'state_dict': eval_model.state_dict(),
-        'config': eval_model.config.__dict__ if hasattr(eval_model.config, '__dict__') else eval_model.config,
+        'config': serializable_config,
     }, temp_model_path)
     
     # Create evaluation script
@@ -138,12 +155,18 @@ except Exception as e:
             script_path = f.name
             
         # Run evaluation in subprocess
+        env = os.environ.copy()
+        if hasattr(device, 'index'):
+            env['CUDA_VISIBLE_DEVICES'] = str(device.index)
+        elif 'cuda' in str(device):
+            env['CUDA_VISIBLE_DEVICES'] = '0'
+            
         result = subprocess.run(
             [sys.executable, script_path],
             capture_output=True,
             text=True,
             timeout=300,  # 5 minute timeout
-            env={{**os.environ, 'CUDA_VISIBLE_DEVICES': str(device.index) if hasattr(device, 'index') else '0'}}
+            env=env
         )
         
         if result.returncode == 0:
