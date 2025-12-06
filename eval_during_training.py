@@ -93,7 +93,7 @@ from baseline_eval import TitanSegmentedLM
 try:
     from lm_eval import evaluator, tasks
 except ImportError:
-    print(json.dumps({"error": "lm-eval not available"}))
+    print(json.dumps({{"error": "lm-eval not available"}}))
     sys.exit(0)
 
 # Clear distributed environment
@@ -136,16 +136,16 @@ try:
     eval_time = time.time() - start_time
     
     boolq_results = results['results']['boolq']
-    metrics = {
+    metrics = {{
         'boolq_acc': boolq_results.get('acc,none', 0.0),
         'boolq_acc_norm': boolq_results.get('acc_norm,none', 0.0),
         'eval_time_sec': eval_time,
         'questions_evaluated': {limit},
-    }
+    }}
     print(json.dumps(metrics))
     
 except Exception as e:
-    print(json.dumps({"error": str(e)}))
+    print(json.dumps({{"error": str(e)}}))
 '''
 
     try:
