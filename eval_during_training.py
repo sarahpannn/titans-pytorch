@@ -106,8 +106,9 @@ device = torch.device("{device}")
 # Load model
 checkpoint = torch.load("{temp_model_path}", map_location="cpu")
 config = TitanLLaMAConfig(**checkpoint['config'])
-model = TitanLLaMAForCausalLM(config).to(device)
+model = TitanLLaMAForCausalLM(config)
 model.load_state_dict(checkpoint['state_dict'])
+model = model.to(device)
 model.eval()
 
 # Load tokenizer
@@ -215,15 +216,92 @@ def quick_eval_boolq(
     Returns:
         Dictionary with evaluation metrics
     """
-    # Use subprocess-based evaluation to prevent memory corruption
-    return quick_eval_boolq_subprocess(
-        model=model,
-        tokenizer=tokenizer,
-        limit=limit,
-        batch_size=batch_size,
-        max_gen_toks=max_gen_toks,
-        device=device
-    )
+    if evaluator is None:
+        return {"error": "lm-eval not available"}
+    
+    if device is None:
+        device = next(model.parameters()).device
+    
+    # Unwrap DDP model if needed
+    eval_model = model.module if hasattr(model, 'module') else model
+    
+    # Clear distributed environment for evaluation
+    import os
+    orig_env = {}
+    for key in ['RANK', 'WORLD_SIZE', 'LOCAL_RANK', 'MASTER_ADDR', 'MASTER_PORT']:
+        if key in os.environ:
+            orig_env[key] = os.environ[key]
+            del os.environ[key]
+    
+    # Set model to eval mode
+    was_training = model.training
+    model.eval()
+    
+    try:
+        # Reset memory states before evaluation
+        if hasattr(eval_model, 'reset_memory_states'):
+            eval_model.reset_memory_states()
+        
+        # Clear CUDA cache
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+        
+        # Create LM wrapper
+        lm = TitanSegmentedLM(
+            model=eval_model,
+            tokenizer=tokenizer,
+            batch_size=batch_size,
+            max_gen_toks=max_gen_toks,
+        )
+        
+        # Run evaluation
+        import time
+        start_time = time.time()
+        task_dict = tasks.get_task_dict(["boolq"])
+        results = evaluator.evaluate(
+            lm=lm,
+            task_dict=task_dict,
+            limit=limit,
+            bootstrap_iters=0,
+        )
+        eval_time = time.time() - start_time
+        
+        # Extract metrics
+        boolq_results = results['results']['boolq']
+        metrics = {
+            'boolq_acc': boolq_results.get('acc,none', 0.0),
+            'boolq_acc_norm': boolq_results.get('acc_norm,none', 0.0),
+            'eval_time_sec': eval_time,
+            'questions_evaluated': limit,
+        }
+        
+        return metrics
+        
+    except Exception as e:
+        return {"error": str(e)}
+        
+    finally:
+        # Cleanup
+        try:
+            if 'lm' in locals():
+                del lm
+            gc.collect()
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+        except:
+            pass
+            
+        # Restore environment
+        for key, value in orig_env.items():
+            os.environ[key] = value
+            
+        # Restore training mode
+        if was_training:
+            model.train()
+            
+        # Reset memory states after evaluation
+        if hasattr(eval_model, 'reset_memory_states'):
+            eval_model.reset_memory_states()
 
 
 def quick_eval_multiple_tasks(
