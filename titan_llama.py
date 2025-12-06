@@ -41,7 +41,7 @@ class TitanLLaMAConfig:
         num_longterm_mem_tokens: int = 4,
         neural_memory_layers: Tuple[int, ...] = (8, 16, 24),
         neural_memory_segment_len: int = 16,
-        neural_memory_batch_size: int = 8,
+        neural_memory_batch_size: int = 16,
         neural_memory_depth: int = 2,
         use_flex_attn: bool = True,
         sliding_window_attn: bool = True,
