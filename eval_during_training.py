@@ -7,6 +7,8 @@ Runs quick evaluations on specific tasks like BoolQ every N steps during trainin
 import torch
 import time
 import gc
+import sys
+import json
 from typing import Dict, Any, Optional
 from transformers import AutoTokenizer
 
@@ -18,6 +20,151 @@ except ImportError:
     evaluator = tasks = LM = None
 
 from baseline_eval import TitanSegmentedLM
+
+
+def quick_eval_boolq_subprocess(
+    model,
+    tokenizer,
+    limit: int = 200,
+    batch_size: int = 1,
+    max_gen_toks: int = 32,
+    device: Optional[str] = None,
+) -> Dict[str, float]:
+    """
+    Quick BoolQ evaluation in subprocess to isolate from training.
+    
+    Args:
+        model: TitanLLaMA model
+        tokenizer: Tokenizer
+        limit: Number of questions to test (default 200)
+        batch_size: Batch size for evaluation
+        max_gen_toks: Max tokens for generation
+        device: Device to run on
+    
+    Returns:
+        Dictionary with evaluation metrics
+    """
+    import tempfile
+    import subprocess
+    import pickle
+    import os
+    
+    if device is None:
+        device = next(model.parameters()).device
+        
+    # Save model state to temporary file
+    with tempfile.NamedTemporaryFile(delete=False, suffix='.pt') as f:
+        temp_model_path = f.name
+        
+    # Save model state dict
+    eval_model = model.module if hasattr(model, 'module') else model
+    torch.save({
+        'state_dict': eval_model.state_dict(),
+        'config': eval_model.config.__dict__ if hasattr(eval_model.config, '__dict__') else eval_model.config,
+    }, temp_model_path)
+    
+    # Create evaluation script
+    eval_script = f'''
+import torch
+import sys
+sys.path.append("{os.getcwd()}")
+import json
+from transformers import AutoTokenizer
+from titan_llama import TitanLLaMAConfig, TitanLLaMAForCausalLM
+from baseline_eval import TitanSegmentedLM
+
+try:
+    from lm_eval import evaluator, tasks
+except ImportError:
+    print(json.dumps({{"error": "lm-eval not available"}}))
+    sys.exit(0)
+
+# Clear distributed environment
+import os
+for key in ['RANK', 'WORLD_SIZE', 'LOCAL_RANK', 'MASTER_ADDR', 'MASTER_PORT']:
+    os.environ.pop(key, None)
+
+device = torch.device("{device}")
+
+# Load model
+checkpoint = torch.load("{temp_model_path}", map_location="cpu")
+config = TitanLLaMAConfig(**checkpoint['config'])
+model = TitanLLaMAForCausalLM(config).to(device)
+model.load_state_dict(checkpoint['state_dict'])
+model.eval()
+
+# Load tokenizer
+tokenizer = AutoTokenizer.from_pretrained("{tokenizer.name_or_path}")
+if tokenizer.pad_token is None:
+    tokenizer.pad_token = tokenizer.eos_token
+
+# Run evaluation
+lm = TitanSegmentedLM(
+    model=model,
+    tokenizer=tokenizer, 
+    batch_size={batch_size},
+    max_gen_toks={max_gen_toks},
+)
+
+try:
+    import time
+    task_dict = tasks.get_task_dict(["boolq"])
+    start_time = time.time()
+    results = evaluator.evaluate(
+        lm=lm,
+        task_dict=task_dict,
+        limit={limit},
+        bootstrap_iters=0,
+    )
+    eval_time = time.time() - start_time
+    
+    boolq_results = results['results']['boolq']
+    metrics = {{
+        'boolq_acc': boolq_results.get('acc,none', 0.0),
+        'boolq_acc_norm': boolq_results.get('acc_norm,none', 0.0),
+        'eval_time_sec': eval_time,
+        'questions_evaluated': {limit},
+    }}
+    print(json.dumps(metrics))
+    
+except Exception as e:
+    print(json.dumps({{"error": str(e)}}))
+'''
+
+    try:
+        # Write evaluation script to temp file
+        with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.py') as f:
+            f.write(eval_script)
+            script_path = f.name
+            
+        # Run evaluation in subprocess
+        result = subprocess.run(
+            [sys.executable, script_path],
+            capture_output=True,
+            text=True,
+            timeout=300,  # 5 minute timeout
+            env={{**os.environ, 'CUDA_VISIBLE_DEVICES': str(device.index) if hasattr(device, 'index') else '0'}}
+        )
+        
+        if result.returncode == 0:
+            try:
+                return json.loads(result.stdout.strip())
+            except json.JSONDecodeError:
+                return {{"error": f"Failed to parse output: {{result.stdout}}"}}
+        else:
+            return {{"error": f"Subprocess failed: {{result.stderr}}"}}
+            
+    except subprocess.TimeoutExpired:
+        return {{"error": "Evaluation timed out"}}
+    except Exception as e:
+        return {{"error": str(e)}}
+    finally:
+        # Cleanup temp files
+        try:
+            os.unlink(temp_model_path)
+            os.unlink(script_path)
+        except:
+            pass
 
 
 def quick_eval_boolq(
@@ -42,111 +189,15 @@ def quick_eval_boolq(
     Returns:
         Dictionary with evaluation metrics
     """
-    if evaluator is None:
-        return {"error": "lm-eval not available"}
-    
-    if device is None:
-        device = next(model.parameters()).device
-    
-    # Unwrap DDP model if needed to avoid distributed training issues
-    eval_model = model.module if hasattr(model, 'module') else model
-    
-    # Ensure model is on correct device
-    if device is not None:
-        eval_model = eval_model.to(device)
-    
-    # Wrap model for LM evaluation
-    # Fix distributed conflicts by clearing lm-eval distributed environment
-    import os
-    
-    # Temporarily clear any distributed environment variables that lm-eval might have set
-    orig_rank = os.environ.get('RANK')
-    orig_world_size = os.environ.get('WORLD_SIZE')
-    orig_local_rank = os.environ.get('LOCAL_RANK')
-    orig_master_addr = os.environ.get('MASTER_ADDR')
-    orig_master_port = os.environ.get('MASTER_PORT')
-    
-    # Force single-GPU evaluation environment
-    os.environ.pop('RANK', None)
-    os.environ.pop('WORLD_SIZE', None)
-    os.environ.pop('LOCAL_RANK', None)
-    os.environ.pop('MASTER_ADDR', None)
-    os.environ.pop('MASTER_PORT', None)
-    
-    # Ensure CUDA context is clean
-    torch.cuda.empty_cache()
-    torch.cuda.synchronize()
-    
-    lm = TitanSegmentedLM(
-        model=eval_model,
+    # Use subprocess-based evaluation to prevent memory corruption
+    return quick_eval_boolq_subprocess(
+        model=model,
         tokenizer=tokenizer,
+        limit=limit,
         batch_size=batch_size,
         max_gen_toks=max_gen_toks,
+        device=device
     )
-    
-    # Set model to eval mode temporarily
-    was_training = model.training
-    model.eval()
-    
-    try:
-        # Get BoolQ task
-        task_dict = tasks.get_task_dict(["boolq"])
-        
-        # Run evaluation with time tracking
-        start_time = time.time()
-        results = evaluator.evaluate(
-            lm=lm,
-            task_dict=task_dict,
-            limit=limit,
-            bootstrap_iters=0,  # Skip confidence intervals for speed
-        )
-        eval_time = time.time() - start_time
-        
-        # Extract metrics
-        boolq_results = results['results']['boolq']
-        metrics = {
-            'boolq_acc': boolq_results.get('acc,none', 0.0),
-            'boolq_acc_norm': boolq_results.get('acc_norm,none', 0.0), 
-            'eval_time_sec': eval_time,
-            'questions_evaluated': limit,
-        }
-        
-        return metrics
-        
-    except Exception as e:
-        return {"error": str(e)}
-        
-    finally:
-        # Clean up GPU memory and restore training mode
-        try:
-            # Clear any cached computation graphs
-            if hasattr(lm, 'model'):
-                del lm.model
-            del lm
-            
-            # Force garbage collection and clear GPU cache
-            import gc
-            gc.collect()
-            torch.cuda.empty_cache()
-            
-        except:
-            pass
-            
-        # Restore original environment variables
-        if orig_rank is not None:
-            os.environ['RANK'] = orig_rank
-        if orig_world_size is not None:
-            os.environ['WORLD_SIZE'] = orig_world_size
-        if orig_local_rank is not None:
-            os.environ['LOCAL_RANK'] = orig_local_rank
-        if orig_master_addr is not None:
-            os.environ['MASTER_ADDR'] = orig_master_addr
-        if orig_master_port is not None:
-            os.environ['MASTER_PORT'] = orig_master_port
-            
-        # Restore training mode
-        if was_training:
-            model.train()
 
 
 def quick_eval_multiple_tasks(
