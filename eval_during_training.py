@@ -56,12 +56,25 @@ def quick_eval_boolq_subprocess(
     with tempfile.NamedTemporaryFile(delete=False, suffix='.pt') as f:
         temp_model_path = f.name
         
-    # Save model state dict
+    # Save model state dict and config
     eval_model = model.module if hasattr(model, 'module') else model
     
     try:
+        # Get config as dict
+        config_dict = {}
+        if hasattr(eval_model, 'config'):
+            for key, value in eval_model.config.__dict__.items():
+                try:
+                    # Test if value is JSON serializable
+                    json.dumps(value)
+                    config_dict[key] = value
+                except (TypeError, ValueError):
+                    # Convert non-serializable values to strings
+                    config_dict[key] = str(value)
+        
         torch.save({
-            'model': eval_model,  # Save the whole model object
+            'state_dict': eval_model.state_dict(),
+            'config': config_dict,
             'tokenizer_name': tokenizer.name_or_path,
         }, temp_model_path)
     except Exception as e:
@@ -93,7 +106,10 @@ device = torch.device("{device}")
 # Load model and tokenizer
 try:
     checkpoint = torch.load("{temp_model_path}", map_location="cpu")
-    model = checkpoint['model'].to(device)
+    config = TitanLLaMAConfig(**checkpoint['config'])
+    model = TitanLLaMAForCausalLM(config)
+    model.load_state_dict(checkpoint['state_dict'])
+    model = model.to(device)
     model.eval()
     
     tokenizer = AutoTokenizer.from_pretrained(checkpoint['tokenizer_name'])
