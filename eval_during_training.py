@@ -80,56 +80,96 @@ def quick_eval_boolq_subprocess(
     except Exception as e:
         return {"error": f"Failed to save model: {str(e)}"}
     
-    # Create evaluation script
+    # Create evaluation script with extensive error logging
     eval_script = f'''
 import torch
 import sys
+import traceback
 sys.path.append("{os.getcwd()}")
 import json
 from transformers import AutoTokenizer
-from titan_llama import TitanLLaMAConfig, TitanLLaMAForCausalLM
-from baseline_eval import TitanSegmentedLM
+
+try:
+    from titan_llama import TitanLLaMAConfig, TitanLLaMAForCausalLM
+    print("DEBUG: Imported TitanLLaMA classes", file=sys.stderr)
+except Exception as e:
+    print(f"IMPORT ERROR TitanLLaMA: {{traceback.format_exc()}}", file=sys.stderr)
+    print(json.dumps({{"error": f"Failed to import TitanLLaMA: {{str(e)}}"}}))
+    sys.exit(1)
+
+try:
+    from baseline_eval import TitanSegmentedLM
+    print("DEBUG: Imported TitanSegmentedLM", file=sys.stderr)
+except Exception as e:
+    print(f"IMPORT ERROR TitanSegmentedLM: {{traceback.format_exc()}}", file=sys.stderr)
+    print(json.dumps({{"error": f"Failed to import TitanSegmentedLM: {{str(e)}}"}}))
+    sys.exit(1)
 
 try:
     from lm_eval import evaluator, tasks
-except ImportError:
-    print(json.dumps({{"error": "lm-eval not available"}}))
-    sys.exit(0)
+    print("DEBUG: Imported lm_eval", file=sys.stderr)
+except ImportError as e:
+    print(f"IMPORT ERROR lm_eval: {{traceback.format_exc()}}", file=sys.stderr)
+    print(json.dumps({{"error": f"lm-eval not available: {{str(e)}}"}}))
+    sys.exit(1)
 
 # Clear distributed environment
 import os
 for key in ['RANK', 'WORLD_SIZE', 'LOCAL_RANK', 'MASTER_ADDR', 'MASTER_PORT']:
     os.environ.pop(key, None)
 
-device = torch.device("{device}")
+try:
+    device = torch.device("{device}")
+    print(f"DEBUG: Using device {{device}}", file=sys.stderr)
+except Exception as e:
+    print(f"DEVICE ERROR: {{traceback.format_exc()}}", file=sys.stderr)
+    print(json.dumps({{"error": f"Device error: {{str(e)}}"}}))
+    sys.exit(1)
 
 # Load model and tokenizer
 try:
+    print("DEBUG: Loading checkpoint", file=sys.stderr)
     checkpoint = torch.load("{temp_model_path}", map_location="cpu")
+    print("DEBUG: Checkpoint loaded", file=sys.stderr)
+    
     config = TitanLLaMAConfig(**checkpoint['config'])
+    print("DEBUG: Config created", file=sys.stderr)
+    
     model = TitanLLaMAForCausalLM(config)
+    print("DEBUG: Model created", file=sys.stderr)
+    
     model.load_state_dict(checkpoint['state_dict'])
+    print("DEBUG: State dict loaded", file=sys.stderr)
+    
     model = model.to(device)
     model.eval()
+    print("DEBUG: Model moved to device and set to eval", file=sys.stderr)
     
     tokenizer = AutoTokenizer.from_pretrained(checkpoint['tokenizer_name'])
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
+    print("DEBUG: Tokenizer loaded", file=sys.stderr)
+    
 except Exception as e:
+    print(f"MODEL LOAD ERROR: {{traceback.format_exc()}}", file=sys.stderr)
     print(json.dumps({{"error": f"Failed to load model: {{str(e)}}"}}))
     sys.exit(1)
 
 # Run evaluation
-lm = TitanSegmentedLM(
-    model=model,
-    tokenizer=tokenizer, 
-    batch_size={batch_size},
-    max_gen_toks={max_gen_toks},
-)
-
 try:
+    print("DEBUG: Creating TitanSegmentedLM", file=sys.stderr)
+    lm = TitanSegmentedLM(
+        model=model,
+        tokenizer=tokenizer, 
+        batch_size={batch_size},
+        max_gen_toks={max_gen_toks},
+    )
+    print("DEBUG: TitanSegmentedLM created", file=sys.stderr)
+    
     import time
     task_dict = tasks.get_task_dict(["boolq"])
+    print("DEBUG: Got BoolQ task", file=sys.stderr)
+    
     start_time = time.time()
     results = evaluator.evaluate(
         lm=lm,
@@ -138,6 +178,7 @@ try:
         bootstrap_iters=0,
     )
     eval_time = time.time() - start_time
+    print("DEBUG: Evaluation completed", file=sys.stderr)
     
     boolq_results = results['results']['boolq']
     metrics = {{
@@ -146,10 +187,13 @@ try:
         'eval_time_sec': eval_time,
         'questions_evaluated': {limit},
     }}
+    print("DEBUG: Metrics extracted", file=sys.stderr)
     print(json.dumps(metrics))
     
 except Exception as e:
-    print(json.dumps({{"error": str(e)}}))
+    print(f"EVALUATION ERROR: {{traceback.format_exc()}}", file=sys.stderr)
+    print(json.dumps({{"error": f"Evaluation failed: {{str(e)}}"}}))
+    sys.exit(1)
 '''
 
     try:
