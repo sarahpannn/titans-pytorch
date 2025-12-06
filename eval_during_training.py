@@ -47,9 +47,12 @@ def quick_eval_boolq(
     if device is None:
         device = next(model.parameters()).device
     
+    # Unwrap DDP model if needed to avoid distributed training issues
+    eval_model = model.module if hasattr(model, 'module') else model
+    
     # Wrap model for LM evaluation
     lm = TitanSegmentedLM(
-        model=model,
+        model=eval_model,
         tokenizer=tokenizer,
         batch_size=batch_size,
         max_gen_toks=max_gen_toks,
@@ -123,9 +126,12 @@ def quick_eval_multiple_tasks(
     if device is None:
         device = next(model.parameters()).device
     
+    # Unwrap DDP model if needed to avoid distributed training issues
+    eval_model = model.module if hasattr(model, 'module') else model
+    
     # Wrap model for LM evaluation  
     lm = TitanSegmentedLM(
-        model=model,
+        model=eval_model,
         tokenizer=tokenizer,
         batch_size=batch_size,
         max_gen_toks=max_gen_toks,

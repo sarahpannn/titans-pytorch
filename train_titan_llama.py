@@ -635,18 +635,26 @@ def main():
         # Intermittent evaluation on BoolQ
         if should_run_intermittent_eval(step, config.intermittent_eval_frequency, config.intermittent_eval_start_step) and is_main_process:
             logger.info(f"Running intermittent BoolQ evaluation at step {step}...")
-            eval_metrics = quick_eval_boolq(
-                model=model,
-                tokenizer=tokenizer,
-                limit=config.intermittent_eval_limit,
-                batch_size=1,
-                max_gen_toks=32,
-                device=device
-            )
-            log_eval_metrics(eval_metrics, step, logger, wandb)
+            try:
+                eval_metrics = quick_eval_boolq(
+                    model=model,
+                    tokenizer=tokenizer,
+                    limit=config.intermittent_eval_limit,
+                    batch_size=1,
+                    max_gen_toks=32,
+                    device=device
+                )
+                log_eval_metrics(eval_metrics, step, logger, wandb)
+            except Exception as e:
+                logger.warning(f"Evaluation failed at step {step}: {str(e)}")
+                if wandb and hasattr(wandb, 'log'):
+                    wandb.log({"eval/error": 1, "eval/step": step})
             
             # Reset memory after evaluation to ensure clean training state
-            model.reset_memory_states()
+            if hasattr(model, 'reset_memory_states'):
+                model.reset_memory_states()
+            elif hasattr(model, 'module') and hasattr(model.module, 'reset_memory_states'):
+                model.module.reset_memory_states()
         
         # Regular checkpointing
         elif step % config.save_interval == 0 and step > 0 and is_main_process:
