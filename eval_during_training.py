@@ -93,7 +93,7 @@ from baseline_eval import TitanSegmentedLM
 try:
     from lm_eval import evaluator, tasks
 except ImportError:
-    print(json.dumps({{"error": "lm-eval not available"}}))
+    print(json.dumps({"error": "lm-eval not available"}))
     sys.exit(0)
 
 # Clear distributed environment
@@ -136,16 +136,16 @@ try:
     eval_time = time.time() - start_time
     
     boolq_results = results['results']['boolq']
-    metrics = {{
+    metrics = {
         'boolq_acc': boolq_results.get('acc,none', 0.0),
         'boolq_acc_norm': boolq_results.get('acc_norm,none', 0.0),
         'eval_time_sec': eval_time,
         'questions_evaluated': {limit},
-    }}
+    }
     print(json.dumps(metrics))
     
 except Exception as e:
-    print(json.dumps({{"error": str(e)}}))
+    print(json.dumps({"error": str(e)}))
 '''
 
     try:
@@ -171,16 +171,19 @@ except Exception as e:
         
         if result.returncode == 0:
             try:
-                return json.loads(result.stdout.strip())
-            except json.JSONDecodeError:
-                return {{"error": f"Failed to parse output: {{result.stdout}}"}}
+                output = result.stdout.strip()
+                if not output:
+                    return {"error": "No output from subprocess"}
+                return json.loads(output)
+            except json.JSONDecodeError as e:
+                return {"error": f"Failed to parse JSON: {e}. Output: {result.stdout[:500]}"}
         else:
-            return {{"error": f"Subprocess failed: {{result.stderr}}"}}
+            return {"error": f"Subprocess failed (code {result.returncode}). stderr: {result.stderr[:500]}"}
             
     except subprocess.TimeoutExpired:
-        return {{"error": "Evaluation timed out"}}
+        return {"error": "Evaluation timed out"}
     except Exception as e:
-        return {{"error": str(e)}}
+        return {"error": str(e)}
     finally:
         # Cleanup temp files
         try:
