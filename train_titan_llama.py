@@ -635,7 +635,14 @@ def main():
         # Intermittent evaluation on BoolQ
         if should_run_intermittent_eval(step, config.intermittent_eval_frequency, config.intermittent_eval_start_step) and is_main_process:
             logger.info(f"Running intermittent BoolQ evaluation at step {step}...")
+            
+            # Save current model state
+            was_training = model.training
+            
             try:
+                # Clear any potential GPU memory issues before eval
+                torch.cuda.empty_cache()
+                
                 eval_metrics = quick_eval_boolq(
                     model=model,
                     tokenizer=tokenizer,
@@ -645,16 +652,33 @@ def main():
                     device=device
                 )
                 log_eval_metrics(eval_metrics, step, logger, wandb)
+                
             except Exception as e:
                 logger.warning(f"Evaluation failed at step {step}: {str(e)}")
                 if wandb and hasattr(wandb, 'log'):
                     wandb.log({"eval/error": 1, "eval/step": step})
+                
+                # Try to recover from memory error
+                torch.cuda.empty_cache()
+                import gc
+                gc.collect()
             
-            # Reset memory after evaluation to ensure clean training state
-            if hasattr(model, 'reset_memory_states'):
-                model.reset_memory_states()
-            elif hasattr(model, 'module') and hasattr(model.module, 'reset_memory_states'):
-                model.module.reset_memory_states()
+            finally:
+                # Ensure model is back in training mode
+                if was_training:
+                    model.train()
+                    
+                # Reset memory after evaluation to ensure clean training state
+                try:
+                    if hasattr(model, 'reset_memory_states'):
+                        model.reset_memory_states()
+                    elif hasattr(model, 'module') and hasattr(model.module, 'reset_memory_states'):
+                        model.module.reset_memory_states()
+                except Exception as e:
+                    logger.warning(f"Failed to reset memory states: {str(e)}")
+                
+                # Final memory cleanup
+                torch.cuda.empty_cache()
         
         # Regular checkpointing
         elif step % config.save_interval == 0 and step > 0 and is_main_process:

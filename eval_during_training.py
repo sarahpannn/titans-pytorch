@@ -6,6 +6,7 @@ Runs quick evaluations on specific tasks like BoolQ every N steps during trainin
 
 import torch
 import time
+import gc
 from typing import Dict, Any, Optional
 from transformers import AutoTokenizer
 
@@ -50,6 +51,10 @@ def quick_eval_boolq(
     # Unwrap DDP model if needed to avoid distributed training issues
     eval_model = model.module if hasattr(model, 'module') else model
     
+    # Ensure model is on correct device
+    if device is not None:
+        eval_model = eval_model.to(device)
+    
     # Wrap model for LM evaluation
     lm = TitanSegmentedLM(
         model=eval_model,
@@ -91,6 +96,21 @@ def quick_eval_boolq(
         return {"error": str(e)}
         
     finally:
+        # Clean up GPU memory and restore training mode
+        try:
+            # Clear any cached computation graphs
+            if hasattr(lm, 'model'):
+                del lm.model
+            del lm
+            
+            # Force garbage collection and clear GPU cache
+            import gc
+            gc.collect()
+            torch.cuda.empty_cache()
+            
+        except:
+            pass
+            
         # Restore training mode
         if was_training:
             model.train()
@@ -128,6 +148,10 @@ def quick_eval_multiple_tasks(
     
     # Unwrap DDP model if needed to avoid distributed training issues
     eval_model = model.module if hasattr(model, 'module') else model
+    
+    # Ensure model is on correct device
+    if device is not None:
+        eval_model = eval_model.to(device)
     
     # Wrap model for LM evaluation  
     lm = TitanSegmentedLM(
