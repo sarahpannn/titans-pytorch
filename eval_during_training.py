@@ -59,26 +59,13 @@ def quick_eval_boolq_subprocess(
     # Save model state dict
     eval_model = model.module if hasattr(model, 'module') else model
     
-    # Convert config to dict safely
-    if hasattr(eval_model.config, '__dict__'):
-        config_dict = eval_model.config.__dict__.copy()
-    else:
-        config_dict = dict(eval_model.config)
-    
-    # Ensure all config values are serializable
-    serializable_config = {}
-    for key, value in config_dict.items():
-        if isinstance(value, (str, int, float, bool, type(None), list, tuple)):
-            serializable_config[key] = value
-        elif hasattr(value, '__dict__'):
-            serializable_config[key] = value.__dict__ if hasattr(value, '__dict__') else str(value)
-        else:
-            serializable_config[key] = str(value)
-    
-    torch.save({
-        'state_dict': eval_model.state_dict(),
-        'config': serializable_config,
-    }, temp_model_path)
+    try:
+        torch.save({
+            'model': eval_model,  # Save the whole model object
+            'tokenizer_name': tokenizer.name_or_path,
+        }, temp_model_path)
+    except Exception as e:
+        return {"error": f"Failed to save model: {str(e)}"}
     
     # Create evaluation script
     eval_script = f'''
@@ -103,18 +90,18 @@ for key in ['RANK', 'WORLD_SIZE', 'LOCAL_RANK', 'MASTER_ADDR', 'MASTER_PORT']:
 
 device = torch.device("{device}")
 
-# Load model
-checkpoint = torch.load("{temp_model_path}", map_location="cpu")
-config = TitanLLaMAConfig(**checkpoint['config'])
-model = TitanLLaMAForCausalLM(config)
-model.load_state_dict(checkpoint['state_dict'])
-model = model.to(device)
-model.eval()
-
-# Load tokenizer
-tokenizer = AutoTokenizer.from_pretrained("{tokenizer.name_or_path}")
-if tokenizer.pad_token is None:
-    tokenizer.pad_token = tokenizer.eos_token
+# Load model and tokenizer
+try:
+    checkpoint = torch.load("{temp_model_path}", map_location="cpu")
+    model = checkpoint['model'].to(device)
+    model.eval()
+    
+    tokenizer = AutoTokenizer.from_pretrained(checkpoint['tokenizer_name'])
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+except Exception as e:
+    print(json.dumps({{"error": f"Failed to load model: {{str(e)}}"}}))
+    sys.exit(1)
 
 # Run evaluation
 lm = TitanSegmentedLM(
@@ -177,9 +164,9 @@ except Exception as e:
                     return {"error": "No output from subprocess"}
                 return json.loads(output)
             except json.JSONDecodeError as e:
-                return {"error": f"Failed to parse JSON: {e}. Output: {result.stdout[:500]}"}
+                return {"error": f"Failed to parse JSON: {e}. STDOUT: {result.stdout[:1000]}, STDERR: {result.stderr[:1000]}"}
         else:
-            return {"error": f"Subprocess failed (code {result.returncode}). stderr: {result.stderr[:500]}"}
+            return {"error": f"Subprocess failed (code {result.returncode}). FULL STDERR: {result.stderr}"}
             
     except subprocess.TimeoutExpired:
         return {"error": "Evaluation timed out"}
@@ -216,92 +203,15 @@ def quick_eval_boolq(
     Returns:
         Dictionary with evaluation metrics
     """
-    if evaluator is None:
-        return {"error": "lm-eval not available"}
-    
-    if device is None:
-        device = next(model.parameters()).device
-    
-    # Unwrap DDP model if needed
-    eval_model = model.module if hasattr(model, 'module') else model
-    
-    # Clear distributed environment for evaluation
-    import os
-    orig_env = {}
-    for key in ['RANK', 'WORLD_SIZE', 'LOCAL_RANK', 'MASTER_ADDR', 'MASTER_PORT']:
-        if key in os.environ:
-            orig_env[key] = os.environ[key]
-            del os.environ[key]
-    
-    # Set model to eval mode
-    was_training = model.training
-    model.eval()
-    
-    try:
-        # Reset memory states before evaluation
-        if hasattr(eval_model, 'reset_memory_states'):
-            eval_model.reset_memory_states()
-        
-        # Clear CUDA cache
-        torch.cuda.empty_cache()
-        torch.cuda.synchronize()
-        
-        # Create LM wrapper
-        lm = TitanSegmentedLM(
-            model=eval_model,
-            tokenizer=tokenizer,
-            batch_size=batch_size,
-            max_gen_toks=max_gen_toks,
-        )
-        
-        # Run evaluation
-        import time
-        start_time = time.time()
-        task_dict = tasks.get_task_dict(["boolq"])
-        results = evaluator.evaluate(
-            lm=lm,
-            task_dict=task_dict,
-            limit=limit,
-            bootstrap_iters=0,
-        )
-        eval_time = time.time() - start_time
-        
-        # Extract metrics
-        boolq_results = results['results']['boolq']
-        metrics = {
-            'boolq_acc': boolq_results.get('acc,none', 0.0),
-            'boolq_acc_norm': boolq_results.get('acc_norm,none', 0.0),
-            'eval_time_sec': eval_time,
-            'questions_evaluated': limit,
-        }
-        
-        return metrics
-        
-    except Exception as e:
-        return {"error": str(e)}
-        
-    finally:
-        # Cleanup
-        try:
-            if 'lm' in locals():
-                del lm
-            gc.collect()
-            torch.cuda.empty_cache()
-            torch.cuda.synchronize()
-        except:
-            pass
-            
-        # Restore environment
-        for key, value in orig_env.items():
-            os.environ[key] = value
-            
-        # Restore training mode
-        if was_training:
-            model.train()
-            
-        # Reset memory states after evaluation
-        if hasattr(eval_model, 'reset_memory_states'):
-            eval_model.reset_memory_states()
+    # Use subprocess-based evaluation to prevent memory corruption
+    return quick_eval_boolq_subprocess(
+        model=model,
+        tokenizer=tokenizer,
+        limit=limit,
+        batch_size=batch_size,
+        max_gen_toks=max_gen_toks,
+        device=device
+    )
 
 
 def quick_eval_multiple_tasks(
