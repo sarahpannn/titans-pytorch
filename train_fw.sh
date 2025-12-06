@@ -7,10 +7,10 @@ CUDA_VISIBLE_DEVICES=0 python3 run_training.py \
     --micro_batch_size 256 \
     --neural_memory_segment_len 64 \
     --neural_memory_batch_size 64 \
-    --total_tokens 100000000 \
-    --intermittent_eval_frequency 100 \
-    --intermittent_eval_limit 50 \
-    --intermittent_eval_start_step 200
+    --total_tokens 1000000000 \
+    --intermittent_eval_frequency 10 \
+    --intermittent_eval_limit 1000 \
+    --intermittent_eval_start_step 0
     
 
 CUDA_VISIBLE_DEVICES=0 python3 other_evals.py \

@@ -71,10 +71,17 @@ class TitanSegmentedLM(LM):
         self._batch_size = batch_size
         self._max_gen_toks = max_gen_toks
         self._device = next(model.parameters()).device
-        # Get actual distributed environment if available
+        # Get actual distributed environment if available, default to single-GPU
         import os
         self._rank = int(os.environ.get('RANK', 0))
         self._world_size = int(os.environ.get('WORLD_SIZE', 1))
+        
+        # Ensure we're in single-GPU mode for evaluation to avoid CUDA illegal access
+        if self._world_size > 1:
+            import warnings
+            warnings.warn("Multi-GPU detected during evaluation, forcing single-GPU mode")
+            self._rank = 0
+            self._world_size = 1
 
     @property
     def eot_token_id(self):
@@ -105,11 +112,27 @@ class TitanSegmentedLM(LM):
     def _reset_memory_states(self):
         """Reset model memory states to prevent memory corruption."""
         try:
+            # Ensure we're on the right device
+            if torch.cuda.is_available():
+                torch.cuda.set_device(self._device)
+                torch.cuda.synchronize()
+                
             if hasattr(self.model, 'reset_memory_states'):
                 self.model.reset_memory_states()
-            torch.cuda.empty_cache()
-        except Exception:
-            pass  # Graceful degradation if reset fails
+                
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                torch.cuda.synchronize()
+        except Exception as e:
+            import warnings
+            warnings.warn(f"Memory reset failed: {e}")
+            # Force harder reset on error
+            if torch.cuda.is_available():
+                try:
+                    torch.cuda.empty_cache()
+                    torch.cuda.ipc_collect()
+                except:
+                    pass
 
     # --- LM Eval required methods -------------------------------------------------
     def loglikelihood(self, requests: Iterable) -> List[Tuple[float, bool]]:

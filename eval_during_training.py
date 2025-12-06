@@ -56,11 +56,26 @@ def quick_eval_boolq(
         eval_model = eval_model.to(device)
     
     # Wrap model for LM evaluation
-    # Note: Only run evaluation on rank 0 to avoid distributed conflicts
+    # Fix distributed conflicts by clearing lm-eval distributed environment
     import os
-    current_rank = int(os.environ.get('RANK', 0))
-    if current_rank != 0:
-        return {"error": "Evaluation should only run on rank 0"}
+    
+    # Temporarily clear any distributed environment variables that lm-eval might have set
+    orig_rank = os.environ.get('RANK')
+    orig_world_size = os.environ.get('WORLD_SIZE')
+    orig_local_rank = os.environ.get('LOCAL_RANK')
+    orig_master_addr = os.environ.get('MASTER_ADDR')
+    orig_master_port = os.environ.get('MASTER_PORT')
+    
+    # Force single-GPU evaluation environment
+    os.environ.pop('RANK', None)
+    os.environ.pop('WORLD_SIZE', None)
+    os.environ.pop('LOCAL_RANK', None)
+    os.environ.pop('MASTER_ADDR', None)
+    os.environ.pop('MASTER_PORT', None)
+    
+    # Ensure CUDA context is clean
+    torch.cuda.empty_cache()
+    torch.cuda.synchronize()
     
     lm = TitanSegmentedLM(
         model=eval_model,
@@ -117,6 +132,18 @@ def quick_eval_boolq(
         except:
             pass
             
+        # Restore original environment variables
+        if orig_rank is not None:
+            os.environ['RANK'] = orig_rank
+        if orig_world_size is not None:
+            os.environ['WORLD_SIZE'] = orig_world_size
+        if orig_local_rank is not None:
+            os.environ['LOCAL_RANK'] = orig_local_rank
+        if orig_master_addr is not None:
+            os.environ['MASTER_ADDR'] = orig_master_addr
+        if orig_master_port is not None:
+            os.environ['MASTER_PORT'] = orig_master_port
+            
         # Restore training mode
         if was_training:
             model.train()
@@ -159,11 +186,26 @@ def quick_eval_multiple_tasks(
     if device is not None:
         eval_model = eval_model.to(device)
     
-    # Note: Only run evaluation on rank 0 to avoid distributed conflicts
+    # Fix distributed conflicts by clearing lm-eval distributed environment
     import os
-    current_rank = int(os.environ.get('RANK', 0))
-    if current_rank != 0:
-        return {"error": "Evaluation should only run on rank 0"}
+    
+    # Temporarily clear any distributed environment variables that lm-eval might have set
+    orig_rank = os.environ.get('RANK')
+    orig_world_size = os.environ.get('WORLD_SIZE')
+    orig_local_rank = os.environ.get('LOCAL_RANK')
+    orig_master_addr = os.environ.get('MASTER_ADDR')
+    orig_master_port = os.environ.get('MASTER_PORT')
+    
+    # Force single-GPU evaluation environment
+    os.environ.pop('RANK', None)
+    os.environ.pop('WORLD_SIZE', None)
+    os.environ.pop('LOCAL_RANK', None)
+    os.environ.pop('MASTER_ADDR', None)
+    os.environ.pop('MASTER_PORT', None)
+    
+    # Ensure CUDA context is clean
+    torch.cuda.empty_cache()
+    torch.cuda.synchronize()
     
     # Wrap model for LM evaluation  
     lm = TitanSegmentedLM(
@@ -225,6 +267,18 @@ def quick_eval_multiple_tasks(
         return {"error": str(e)}
         
     finally:
+        # Restore original environment variables
+        if 'orig_rank' in locals() and orig_rank is not None:
+            os.environ['RANK'] = orig_rank
+        if 'orig_world_size' in locals() and orig_world_size is not None:
+            os.environ['WORLD_SIZE'] = orig_world_size
+        if 'orig_local_rank' in locals() and orig_local_rank is not None:
+            os.environ['LOCAL_RANK'] = orig_local_rank
+        if 'orig_master_addr' in locals() and orig_master_addr is not None:
+            os.environ['MASTER_ADDR'] = orig_master_addr
+        if 'orig_master_port' in locals() and orig_master_port is not None:
+            os.environ['MASTER_PORT'] = orig_master_port
+            
         # Restore training mode
         if was_training:
             model.train()
