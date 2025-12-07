@@ -32,8 +32,7 @@ from tqdm import tqdm
 from titan_llama import TitanLLaMAConfig, TitanLLaMAForCausalLM
 from train_datasets import SlimPajamaDataset, FineWebEduDataset
 from cuda_utils import log_cuda_mem
-from simple_eval import eval_winogrande_boolq
-from eval_during_training import quick_eval_boolq, should_run_intermittent_eval, log_eval_metrics
+from simple_eval import eval_winogrande_boolq, quick_eval_boolq, should_run_intermittent_eval, log_eval_metrics
 
 
 @dataclass
