@@ -228,33 +228,59 @@ class BoolQDataset(TorchDataset):
             prompt = f"Passage: {passage}\nQuestion: {question}\nAnswer (yes or no):"
             target_answer = " yes" if answer else " no"
             
-            # Full text for training (prompt + target)
-            full_text = prompt + target_answer
-            
-            # Tokenize the full text
-            tokens = self.tokenizer(
-                full_text,
-                max_length=self.max_length,
-                padding="max_length", 
-                truncation=True,
-                return_tensors="pt"
-            )
-            
-            input_ids = tokens['input_ids'].squeeze(0)
-            attention_mask = tokens['attention_mask'].squeeze(0)
-            
-            # Create labels: mask the prompt part, only train on the answer
+            # First tokenize prompt to get its length
             prompt_tokens = self.tokenizer(
                 prompt,
-                max_length=self.max_length,
                 truncation=True,
+                return_tensors="pt",
+                add_special_tokens=True
+            )
+            prompt_length = prompt_tokens['input_ids'].shape[1]
+            
+            # Reserve space for the answer (typically just 1-2 tokens)
+            max_prompt_length = self.max_length - 5  # Reserve space for answer + EOS
+            
+            # Tokenize prompt with length limit
+            if prompt_length > max_prompt_length:
+                prompt_tokens = self.tokenizer(
+                    prompt,
+                    max_length=max_prompt_length,
+                    truncation=True,
+                    padding=False,
+                    return_tensors="pt",
+                    add_special_tokens=True
+                )
+            
+            # Tokenize answer separately
+            answer_tokens = self.tokenizer(
+                target_answer,
+                add_special_tokens=False,
                 return_tensors="pt"
             )
-            prompt_length = (prompt_tokens['input_ids'] != self.tokenizer.pad_token_id).sum().item()
             
-            # Labels are same as input_ids, but mask prompt part with -100
+            # Combine prompt + answer
+            input_ids = torch.cat([
+                prompt_tokens['input_ids'].squeeze(0),
+                answer_tokens['input_ids'].squeeze(0)
+            ], dim=0)
+            
+            # Pad to max_length
+            if len(input_ids) < self.max_length:
+                padding_length = self.max_length - len(input_ids)
+                input_ids = torch.cat([
+                    input_ids,
+                    torch.full((padding_length,), self.tokenizer.pad_token_id, dtype=torch.long)
+                ], dim=0)
+            else:
+                input_ids = input_ids[:self.max_length]
+            
+            # Create attention mask
+            attention_mask = (input_ids != self.tokenizer.pad_token_id).long()
+            
+            # Create labels: mask the prompt part, only train on the answer
             labels = input_ids.clone()
-            labels[:prompt_length] = -100  # Don't compute loss on prompt
+            prompt_actual_length = prompt_tokens['input_ids'].shape[1]
+            labels[:prompt_actual_length] = -100  # Don't compute loss on prompt
             
             return {
                 'input_ids': input_ids,
