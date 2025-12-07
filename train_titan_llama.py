@@ -32,6 +32,7 @@ from tqdm import tqdm
 from titan_llama import TitanLLaMAConfig, TitanLLaMAForCausalLM
 from train_datasets import SlimPajamaDataset, FineWebEduDataset
 from cuda_utils import log_cuda_mem
+from simple_eval import eval_winogrande_boolq
 from eval_during_training import quick_eval_boolq, should_run_intermittent_eval, log_eval_metrics
 
 
@@ -477,13 +478,15 @@ def main():
         )
 
     else: raise RuntimeError("Could not infer dataset")
+
+    print("THIS IS THE MICRO BS FROM CFG: ", config.micro_batch_size)
     
     # Create data loaders
     train_dataloader = DataLoader(
         train_dataset,
         batch_size=config.micro_batch_size,
         shuffle=False,  # Streaming dataset
-        num_workers=4,
+        num_workers=2,
         pin_memory=True
     )
     
@@ -539,6 +542,8 @@ def main():
             if len(input_ids.shape) == 1: input_ids = input_ids.unsqueeze(0)
             labels = batch['labels'].to(device) 
             if len(labels.shape) == 1: labels = labels.unsqueeze(0)
+
+            # print("TRAIN SIZE: ", input_ids.shape)
             
             # Forward pass
             outputs = model(input_ids=input_ids, labels=labels)
@@ -634,80 +639,50 @@ def main():
         
         # Intermittent evaluation on BoolQ
         if should_run_intermittent_eval(step, config.intermittent_eval_frequency, config.intermittent_eval_start_step) and is_main_process:
-            logger.info(f"Running intermittent BoolQ evaluation at step {step}...")
+            logger.info(f"Running intermittent evaluation at step {step}...")
+
+            model.eval() 
             
-            # Save current model state
-            was_training = model.training
-            
+            # Reset model memory states BEFORE evaluation
             try:
-                # Complete isolation: clear CUDA context and force synchronization
-                torch.cuda.empty_cache()
-                torch.cuda.synchronize()
-                
-                # Reset model memory states BEFORE evaluation
-                try:
-                    if hasattr(model, 'reset_memory_states'):
-                        model.reset_memory_states()
-                    elif hasattr(model, 'module') and hasattr(model.module, 'reset_memory_states'):
-                        model.module.reset_memory_states()
-                except Exception as e:
-                    logger.warning(f"Failed to reset memory states before eval: {str(e)}")
-                
-                # Additional memory cleanup before evaluation
-                import gc
-                gc.collect()
-                torch.cuda.empty_cache()
-                torch.cuda.synchronize()
-                
-                # Run evaluation in subprocess (complete isolation)
-                eval_metrics = quick_eval_boolq(
-                    model=model,
-                    tokenizer=tokenizer,
-                    limit=config.intermittent_eval_limit,
-                    batch_size=1,
-                    max_gen_toks=32,
-                    device=device
-                )
-                log_eval_metrics(eval_metrics, step, logger, wandb)
-                
+                if hasattr(model, 'reset_memory_states'):
+                    model.reset_memory_states()
+                elif hasattr(model, 'module') and hasattr(model.module, 'reset_memory_states'):
+                    model.module.reset_memory_states()
             except Exception as e:
-                logger.warning(f"Evaluation error at step {step}: {str(e)}")
-                if wandb and hasattr(wandb, 'log'):
-                    wandb.log({"eval/error": 1, "eval/step": step})
-                
-                # Aggressive recovery from memory error
-                try:
-                    torch.cuda.empty_cache()
-                    torch.cuda.synchronize()
-                    import gc
-                    gc.collect()
-                except Exception:
-                    pass
+                logger.warning(f"Failed to reset memory states before eval: {str(e)}")
+
+            eval_metrics = eval_winogrande_boolq(
+                model=model,
+                tokenizer=tokenizer,
+                device=device,
+                max_examples=config.intermittent_eval_limit,
+                boolq_batch_size=config.micro_batch_size,
+            )
+
+            logger.info(
+                f"[eval] step {step} "
+                f"BoolQ acc={eval_metrics['boolq_acc']:.3f}, "
+                f"Winogrande acc={eval_metrics['winogrande_acc']:.3f}"
+            )
+            log_eval_metrics(eval_metrics, step, logger, wandb)
+
+            # Complete cleanup and state restoration
+            # Force complete CUDA cleanup
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
             
-            finally:
-                # Complete cleanup and state restoration
-                try:
-                    # Force complete CUDA cleanup
-                    torch.cuda.empty_cache()
-                    torch.cuda.synchronize()
-                    
-                    # Reset memory states after evaluation
-                    if hasattr(model, 'reset_memory_states'):
-                        model.reset_memory_states()
-                    elif hasattr(model, 'module') and hasattr(model.module, 'reset_memory_states'):
-                        model.module.reset_memory_states()
-                        
-                    # Final memory cleanup
-                    torch.cuda.empty_cache()
-                    torch.cuda.synchronize()
-                    
-                except Exception as e:
-                    logger.warning(f"Failed to complete cleanup: {str(e)}")
-                    # If cleanup fails, continue anyway to prevent training interruption
+            # Reset memory states after evaluation
+            if hasattr(model, 'reset_memory_states'):
+                model.reset_memory_states()
+            elif hasattr(model, 'module') and hasattr(model.module, 'reset_memory_states'):
+                model.module.reset_memory_states()
                 
-                # Ensure model is back in training mode
-                if was_training:
-                    model.train()
+            # Final memory cleanup
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+
+            model.train()
         
         # Regular checkpointing
         elif step % config.save_interval == 0 and step > 0 and is_main_process:

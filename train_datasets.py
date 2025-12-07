@@ -5,8 +5,10 @@ import transformers
 
 from datasets import Dataset, load_dataset
 from transformers import AutoTokenizer
+from torch.utils.data import Dataset as TorchDataset
 
-class FineWebEduDataset(Dataset):
+
+class FineWebEduDataset(TorchDataset):
     """Dataset class for FineWeb-Edu tokenized data."""
 
     def __init__(
@@ -92,7 +94,7 @@ class FineWebEduDataset(Dataset):
                 "labels": dummy_ids.clone(),
             }
 
-class SlimPajamaDataset(Dataset):
+class SlimPajamaDataset(TorchDataset):
     """Dataset class for SlimPajama tokenized data."""
     
     def __init__(

@@ -3,4 +3,4 @@ salloc -p mit_normal_gpu \
   --gres=gpu:h200:1 \
   -c 8 \
   --mem=64G \
-  --time=02:00:00
+  --time=05:00:00
