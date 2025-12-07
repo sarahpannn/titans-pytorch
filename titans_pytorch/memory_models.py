@@ -25,9 +25,16 @@ class LayerNorm(Module):
     def forward(self, x):
         gamma = self.gamma
 
-        if gamma.ndim == 2:
-            gamma = rearrange(gamma, 'b d -> b 1 d')
+        # if gamma.ndim == 2:
+        #     gamma = rearrange(gamma, 'b d -> b 1 d')
+        
+        # # bhd,hdf->bhf
+        # if gamma.ndim == 3:
+        #     gamma = rearrange(gamma, 'h 1 d -> 1 h d')
 
+        while gamma.ndim > 1: gamma = gamma.mean(dim=0)
+
+        # print(x.shape, gamma.shape)
         return self.ln(x) * (gamma + 1.)
 
 # norm + residual wrapper, as used in original TTT paper
@@ -67,18 +74,57 @@ class MemoryMLP(Module):
         for weight in self.weights:
             nn.init.xavier_uniform_(weight)
 
+    def _apply_memory_linear(self, x, weight, bias=None):
+        """
+        x:      [..., D]      or [B, H, D]
+        weight: [D, F]        or [H, D, F]
+        bias:   [F] or [H, F] (broadcastable)
+        """
+        if len(weight.shape) == 2:
+            # weight: [D, F]  (in, out) – this matches your 2-D prints
+            # so just do a standard linear
+            x = x @ weight
+        elif len(weight.shape) == 3:
+            # weight: [H, D, F]
+            # expect x: [B, H, D]
+            # per-head matmul: out[b, h, f] = sum_d x[b, h, d] * weight[h, d, f]
+            x = torch.einsum("bhd,hdf->bhf", x, weight)
+        else:
+            raise RuntimeError(
+                f"Unsupported weight.ndim={weight.ndim} for memory linear (x={x.shape}, w={weight.shape})"
+            )
+
+        if bias is not None:
+            x = x + bias
+
+        return x
+
     def forward(
         self,
         x
-    ):
+    ):  
+
+        orig_shape = x.shape
+        d = orig_shape[-1]
+
+        batch_dim = x.numel() // d
+        x = x.reshape(batch_dim, d)
+
         for ind, weight in enumerate(self.weights):
             is_first = ind == 0
 
             if not is_first:
                 x = F.gelu(x)
 
-            x = x @ weight
+            w = weight
 
+            if w.ndim == 3:
+                w = w.mean(dim=0)
+
+            # x = self._apply_memory_linear(x, weight)
+            x = x @ w
+
+        x = x.reshape(*orig_shape[:-1], x.shape[-1])
         return x
 
 # memory mlp, but with gated residual + final projection

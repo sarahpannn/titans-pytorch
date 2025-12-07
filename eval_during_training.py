@@ -119,8 +119,9 @@ for key in ['RANK', 'WORLD_SIZE', 'LOCAL_RANK', 'MASTER_ADDR', 'MASTER_PORT']:
     os.environ.pop(key, None)
 
 try:
-    device = torch.device("{device}")
-    print(f"DEBUG: Using device {{device}}", file=sys.stderr)
+    # Use cuda:0 in subprocess since CUDA_VISIBLE_DEVICES maps it
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    print(f"DEBUG: Using device {{device}}, CUDA available: {{torch.cuda.is_available()}}", file=sys.stderr)
 except Exception as e:
     print(f"DEVICE ERROR: {{traceback.format_exc()}}", file=sys.stderr)
     print(json.dumps({{"error": f"Device error: {{str(e)}}"}}))
@@ -202,12 +203,13 @@ except Exception as e:
             f.write(eval_script)
             script_path = f.name
             
-        # Run evaluation in subprocess
+        # Run evaluation in subprocess with proper CUDA setup
         env = os.environ.copy()
-        if hasattr(device, 'index'):
-            env['CUDA_VISIBLE_DEVICES'] = str(device.index)
-        elif 'cuda' in str(device):
-            env['CUDA_VISIBLE_DEVICES'] = '0'
+        # Make sure subprocess can see the same GPU as training
+        env['CUDA_VISIBLE_DEVICES'] = env.get('CUDA_VISIBLE_DEVICES', '0')
+        
+        # Debug: print what CUDA device we're trying to use
+        print(f"DEBUG: Setting CUDA_VISIBLE_DEVICES={env['CUDA_VISIBLE_DEVICES']} for subprocess")
             
         result = subprocess.run(
             [sys.executable, script_path],
