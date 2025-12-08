@@ -48,98 +48,91 @@ from cuda_utils import log_cuda_mem
 from simple_eval import eval_winogrande_boolq, quick_eval_boolq, should_run_intermittent_eval, log_eval_metrics
 
 
-def compute_attention_distillation_loss(model, input_ids, attention_mask, distillation_layers, device):
+def compute_attention_distillation_loss(
+    student_model_hiddens,
+    teacher_model,
+    input_ids,
+    attention_mask,
+    distillation_layers,
+    device,
+):
     """
-    Compute attention distillation loss by comparing segmented attention outputs
-    with and without flex attention optimizations.
+    Distill from a full-attention *teacher backbone* into a segmented-attention
+    *student backbone* by supervising hidden state outputs at selected layers.
+
+    - Teacher: run full-attention model, get hidden_states (no grad).
+    - Student: run segmented model, get hidden_states (with grad).
+    - For each layer index ℓ in distillation_layers, add an MSE loss between
+      teacher_hidden_states[ℓ + 1] and student_hidden_states[ℓ + 1].
+      (In HF, hidden_states[0] = embeddings, hidden_states[1] = after 1st layer, etc.)
+
+    Args:
+        student_model_hiddens: hidden states from the segmented attention model (trainable).
+        teacher_model:  model with full attention (frozen).
+        input_ids:      [B, N] token ids.
+        attention_mask: [B, N] mask.
+        distillation_layers: iterable of layer indices (0-based layer ids).
+        device:         torch.device for the returned scalar loss.
     """
-    total_distill_loss = 0.0
-    num_layers = len(distillation_layers)
-    
-    if num_layers == 0:
+    if not distillation_layers:
         return torch.tensor(0.0, device=device)
+
+    input_ids = input_ids.to(device)
+    if attention_mask is not None:
+        attention_mask = attention_mask.to(device)
+
+    student_hiddens = student_model_hiddens
     
-    # Get the base model (unwrap from DDP if needed)
-    base_model = model.module if hasattr(model, 'module') else model
-    if not hasattr(base_model, 'model'):
+    if student_hiddens is None:
+        print('student hiddens is none')
+        # model wasn't configured to return them
         return torch.tensor(0.0, device=device)
-    
-    transformer_layers = base_model.model.layers
-    
-    # Run a forward pass to collect hidden states and value residuals
+
+    # ---- Teacher forward (full attention, no grad) ----
     with torch.no_grad():
-        inputs_embeds = base_model.model.embed_tokens(input_ids)
-        hidden_states = inputs_embeds
-        value_residual = None
+        teacher_outputs = teacher_model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            output_hidden_states=True,
+            use_cache=False,
+        )
         
-        # Store states for distillation layers  
-        layer_states = {}
-        
-        for layer_idx, layer in enumerate(transformer_layers):
-            if layer_idx in distillation_layers:
-                # Store both the input hidden state and current value residual
-                layer_states[layer_idx] = {
-                    'hidden_states': hidden_states.clone(),
-                    'value_residual': value_residual.clone() if value_residual is not None else None
-                }
-            
-            # Forward through layer to get next states
-            layer_outputs = layer(
-                hidden_states,
-                attention_mask=attention_mask,
-                use_cache=False,
-                output_attentions=False,
-                value_residual=value_residual,
-            )
-            hidden_states = layer_outputs[0]
-            # Extract value residual for next layer (second to last output)
-            if len(layer_outputs) >= 2:
-                value_residual = layer_outputs[-2]  # value_residual is second to last
-    
-    # Now compute distillation loss for each specified layer
+    try: 
+        teacher_hiddens = getattr(teacher_outputs, "hidden_states")
+    except AttributeError:
+        teacher_hiddens = teacher_outputs.get('hidden_states', None)
+
+    if teacher_hiddens is None:
+        print('teacher hiddens is none')
+        return torch.tensor(0.0, device=device)
+
+    # Both are tuples: length = num_layers + 1
+    # hidden_states[0] = embeddings, hidden_states[ℓ+1] = output of layer ℓ.
+    total_loss = 0.0
+    counted_layers = 0
+
     for layer_idx in distillation_layers:
-        if layer_idx >= len(transformer_layers) or layer_idx not in layer_states:
+        # Convert from layer index to hidden_states index
+        s_idx = layer_idx + 1
+        t_idx = layer_idx + 1
+
+        if s_idx >= len(student_hiddens) or t_idx >= len(teacher_hiddens):
             continue
-            
-        layer = transformer_layers[layer_idx]
-        states = layer_states[layer_idx]
-        layer_input = states['hidden_states']
-        layer_value_residual = states['value_residual']
-        
-        # Get the segmented attention module
-        if hasattr(layer, 'self_attn') and hasattr(layer.self_attn, 'segmented_attn'):
-            attn_module = layer.self_attn.segmented_attn
-            
-            # Normalize input (as done in the layer)
-            normalized_input = layer.input_layernorm(layer_input)
-            
-            # For distillation, we don't use value residuals to avoid shape mismatches
-            # We just want to compare the attention mechanisms themselves
-            appropriate_value_residual = None
-            if hasattr(attn_module, 'to_learned_v_mix') and attn_module.to_learned_v_mix is not None:
-                # This layer expects value residual - use a zero tensor with correct shape
-                appropriate_value_residual = torch.zeros_like(normalized_input)
-            
-            # Target: attention without flex attention (more basic implementation)
-            with torch.no_grad():
-                attn_target, _ = attn_module(
-                    normalized_input,
-                    disable_flex_attn=True,
-                    value_residual=appropriate_value_residual
-                )
-            
-            # Student: attention with flex attention enabled
-            attn_output, _ = attn_module(
-                normalized_input, 
-                disable_flex_attn=False,
-                value_residual=appropriate_value_residual
-            )
-            
-            # Compute MSE loss between outputs
-            layer_distill_loss = F.mse_loss(attn_output, attn_target.detach())
-            total_distill_loss += layer_distill_loss
-    
-    return total_distill_loss / max(num_layers, 1)
+
+        s_h = student_hiddens[s_idx]  # [B, N, D]
+        t_h = teacher_hiddens[t_idx]  # [B, N, D]
+
+        # make sure teacher matches student dtype/device
+        t_h = t_h.to(device=s_h.device, dtype=s_h.dtype)
+
+        layer_loss = F.mse_loss(s_h, t_h.detach())
+        total_loss += layer_loss
+        counted_layers += 1
+
+    if counted_layers == 0:
+        return torch.tensor(0.0, device=device)
+
+    return total_loss / counted_layers
 
 
 @dataclass
@@ -344,7 +337,7 @@ def create_model_and_optimizer(config: TrainingConfig, device):
         else:
             bucket_counts["other"] += p.numel()
 
-        print("\n[create_model_and_optimizer] Trainable param breakdown:")
+        # print("\n[create_model_and_optimizer] Trainable param breakdown:")
         for k, v in bucket_counts.items():
             print(f"  - {k:18s}: {v:,} ({v/1e6:.2f}M)")
 
@@ -360,8 +353,8 @@ def create_model_and_optimizer(config: TrainingConfig, device):
             else:
                 regular_params.append(param)
 
-        print(f"\n[create_model_and_optimizer] #trainable nm params: {sum(p.numel() for p in neural_memory_params):,}")
-        print(f"[create_model_and_optimizer] #trainable non-nm params: {sum(p.numel() for p in regular_params):,}\n")
+        # print(f"\n[create_model_and_optimizer] #trainable nm params: {sum(p.numel() for p in neural_memory_params):,}")
+        # print(f"[create_model_and_optimizer] #trainable non-nm params: {sum(p.numel() for p in regular_params):,}\n")
     
     # Create optimizers
     optimizer_groups = []
@@ -724,14 +717,19 @@ def main(config=None):
             # print("TRAIN SIZE: ", input_ids.shape)
             
             # Forward pass
-            outputs = model(input_ids=input_ids, labels=labels)
+            outputs = model(input_ids=input_ids, labels=labels, output_hidden_states=True)
             lm_loss = outputs['loss'] / config.gradient_accumulation_steps
             
             # Compute attention distillation loss if enabled
             distill_loss = torch.tensor(0.0, device=device)
             if config.use_attention_distillation:
                 distill_loss = compute_attention_distillation_loss(
-                    model, input_ids, attention_mask, config.distillation_layers, device
+                    outputs['hidden_states'], 
+                    model.backbone_model, 
+                    input_ids, 
+                    attention_mask, 
+                    config.distillation_layers, 
+                    device
                 )
                 distill_loss = distill_loss / config.gradient_accumulation_steps
             

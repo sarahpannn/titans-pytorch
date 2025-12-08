@@ -518,6 +518,7 @@ class TitanLLaMAForCausalLM(nn.Module):
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
         self.padding_idx = getattr(config, 'pad_token_id', None)
+        self.backbone_model = None
 
     def forward(
         self,
@@ -848,7 +849,7 @@ class TitanLLaMAForCausalLM(nn.Module):
         base_model = AutoModelForCausalLM.from_pretrained(
             base_model_name_or_path,
             dtype=dtype,
-            device_map=device_map or "cuda",
+            device_map="cuda",
             **from_pretrained_kwargs,
         )
 
@@ -856,6 +857,11 @@ class TitanLLaMAForCausalLM(nn.Module):
         model.to(dtype=dtype, device='cuda')
 
         model._load_llama_weights(base_model)
+
+        model.backbone_model = base_model
+        model.backbone_model.eval().to(dtype=dtype, device='cuda')
+
+        print("BACKBONE MODEL DEVICE:", next(model.backbone_model.parameters()).device)
 
         del base_model
         torch.cuda.empty_cache()
