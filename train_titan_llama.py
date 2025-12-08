@@ -511,26 +511,27 @@ def evaluate_model(model, eval_dataloader, device, max_eval_steps=100):
         }
 
 
-def main():
+def main(config=None):
     """Main training function."""
     
-    # Parse command line arguments
-    parser = argparse.ArgumentParser(description="Train TitanLLaMA with optional attention distillation")
-    parser.add_argument("--use-attention-distillation", action="store_true", 
-                       help="Enable attention distillation loss")
-    parser.add_argument("--distillation-weight", type=float, default=0.1,
-                       help="Weight for distillation loss vs LM loss (default: 0.1)")
-    parser.add_argument("--distillation-layers", nargs="+", type=int, default=[8, 16, 24],
-                       help="Which layers to apply distillation to (default: 8 16 24)")
-    
-    args = parser.parse_args()
-    
-    # Create config with command-line overrides
-    config = TrainingConfig(
-        use_attention_distillation=args.use_attention_distillation,
-        distillation_weight=args.distillation_weight,
-        distillation_layers=tuple(args.distillation_layers)
-    )
+    if config is None:
+        # Parse command line arguments
+        parser = argparse.ArgumentParser(description="Train TitanLLaMA with optional attention distillation")
+        parser.add_argument("--use-attention-distillation", action="store_true", 
+                           help="Enable attention distillation loss")
+        parser.add_argument("--distillation-weight", type=float, default=0.1,
+                           help="Weight for distillation loss vs LM loss (default: 0.1)")
+        parser.add_argument("--distillation-layers", nargs="+", type=int, default=[8, 16, 24],
+                           help="Which layers to apply distillation to (default: 8 16 24)")
+        
+        args = parser.parse_args()
+        
+        # Create config with command-line overrides
+        config = TrainingConfig(
+            use_attention_distillation=args.use_attention_distillation,
+            distillation_weight=args.distillation_weight,
+            distillation_layers=tuple(args.distillation_layers)
+        )
     
     # Set up logging
     logger = setup_logging(config)
