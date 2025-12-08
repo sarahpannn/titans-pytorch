@@ -1,0 +1,15 @@
+CUDA_LAUNCH_BLOCKING=1 CUDA_VISIBLE_DEVICES=0 python3 run_training.py \
+    --dataset_name mixed \
+    --segment_len 128 \
+    --sequence_length 256 \
+    --log_interval 1 \
+    --batch_size 256 \
+    --learning_rate 0.001 \
+    --micro_batch_size 16 \
+    --neural_memory_segment_len 64 \
+    --neural_memory_batch_size 64 \
+    --intermittent_eval_frequency 30 \
+    --intermittent_eval_limit 256 \
+    --intermittent_eval_start_step 0 \
+    --eval_interval 1000 \
+    --pretrained_from_checkpoint titan_llama_checkpoints/latest_checkpoint.pt

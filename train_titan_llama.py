@@ -109,6 +109,7 @@ class TrainingConfig:
     
     # Resume training
     resume_from_checkpoint: Optional[str] = None
+    pretrained_from_checkpoint: Optional[str] = None
     
     # Pretrained backbone
     use_pretrained_backbone: bool = True
@@ -347,11 +348,36 @@ def load_checkpoint(model, optimizer, scheduler, checkpoint_path: str):
     print(f"Loading checkpoint from {checkpoint_path}")
     checkpoint = torch.load(checkpoint_path, map_location='cpu')
     
-    model.load_state_dict(checkpoint['model_state_dict'])
-    # optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-    scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-    
-    return checkpoint['step'], checkpoint['loss']
+    model_to_load = model.module if isinstance(model, DDP) else model
+    model_to_load.load_state_dict(checkpoint["model_state_dict"])
+
+    if "scheduler_state_dict" in checkpoint:
+        scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
+
+    return checkpoint["step"], checkpoint.get("loss", float("nan"))
+
+def load_pretrained_from_checkpoint(model, checkpoint_path: str):
+    """
+    Load ONLY model weights from a checkpoint (for pretrained_from_checkpoint).
+    Does NOT touch optimizer, scheduler, or training step.
+    """
+    print(f"Loading pretrained model weights from checkpoint {checkpoint_path}")
+    checkpoint = torch.load(checkpoint_path, map_location="cpu")
+
+    # Accept multiple checkpoint formats
+    if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
+        state_dict = checkpoint["model_state_dict"]
+    elif isinstance(checkpoint, dict) and "state_dict" in checkpoint:
+        state_dict = checkpoint["state_dict"]
+    else:
+        # Assume it's already a plain state dict
+        state_dict = checkpoint
+
+    missing, unexpected = model.load_state_dict(state_dict, strict=False)
+    if missing:
+        print(f"Missing keys when loading pretrained checkpoint (showing first 10): {missing[:10]}")
+    if unexpected:
+        print(f"Unexpected keys when loading pretrained checkpoint (showing first 10): {unexpected[:10]}")
 
 
 def evaluate_model(model, eval_dataloader, device, max_eval_steps=100):
@@ -490,7 +516,7 @@ def main():
         train_dataset,
         batch_size=config.micro_batch_size,
         shuffle=False,  # Streaming dataset
-        num_workers=2,
+        num_workers=0,  # Set to 0 to avoid multiprocessing issues with HF datasets
         pin_memory=True
     )
     
@@ -498,7 +524,7 @@ def main():
         eval_dataset,
         batch_size=config.micro_batch_size,
         shuffle=False,
-        num_workers=2,
+        num_workers=0,  # Set to 0 to avoid multiprocessing issues with HF datasets
         pin_memory=True
     )
 
@@ -510,7 +536,11 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained(config.tokenizer_name)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
-    
+
+    if config.pretrained_from_checkpoint and not config.resume_from_checkpoint:
+        # If DDP is enabled, load into the underlying module
+        model_to_load = model.module if isinstance(model, DDP) else model
+        load_pretrained_from_checkpoint(model_to_load, config.pretrained_from_checkpoint)
     
     # Resume from checkpoint if specified
     start_step = 0
