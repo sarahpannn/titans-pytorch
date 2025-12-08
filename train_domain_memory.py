@@ -1,18 +1,19 @@
 #!/usr/bin/env python3
+# >>> TEST LINE FROM VSCODE <<<
 """
 Domain-specific NeuralMemory finetuning.
 
 Trains only the Titans NeuralMemory parameters on a downstream domain dataset
 while keeping the frozen LLaMA backbone and segmented-attention adapter fixed.
-Useful for experiments to test whether memory modules cnan learn information relevant to specific downstream domains.
-
+Useful for experiments to test whether memory modules can learn information
+relevant to specific downstream domains.
 """
 
 import argparse
 import math
 import os
 from dataclasses import dataclass
-from typing import Callable, Dict, Optional
+from typing import Callable, Dict, Optional, Any
 
 import torch
 from torch.utils.data import Dataset, DataLoader
@@ -30,7 +31,9 @@ def _join_options(option_dict):
     """Turn a dict of options into a readable A/B/C/D string."""
     letters = "ABCD"
     options = []
-    for i, key in enumerate(["option_a", "option_b", "option_c", "option_d", "opa", "opb", "opc", "opd"]):
+    for i, key in enumerate(
+        ["option_a", "option_b", "option_c", "option_d", "opa", "opb", "opc", "opd"]
+    ):
         if key in option_dict and option_dict[key]:
             options.append(f"({letters[i % len(letters)]}) {option_dict[key]}")
     return " ".join(options)
@@ -46,12 +49,16 @@ def medmcqa_template(example: Dict) -> str:
     options = _join_options(opts)
     answer = example.get("answer") or example.get("cop")
     try:
-        # Convert numeric label into the matching option text if possible
         idx = int(answer)
-        answer_text = list(filter(None, opts.values()))[idx] if idx < len(list(filter(None, opts.values()))) else str(answer)
+        vals = list(filter(None, opts.values()))
+        answer_text = vals[idx] if idx < len(vals) else str(answer)
     except Exception:
         answer_text = str(answer)
-    return f"Question: {example.get('question', '')}\nOptions: {options}\nCorrect answer: {answer_text}"
+    return (
+        f"Question: {example.get('question', '')}\n"
+        f"Options: {options}\n"
+        f"Correct answer: {answer_text}"
+    )
 
 
 def casehold_template(example: Dict) -> str:
@@ -60,9 +67,20 @@ def casehold_template(example: Dict) -> str:
     question = example.get("question", "")
     candidates = example.get("candidates") or example.get("answers") or []
     label = example.get("label", -1)
-    labeled_answer = candidates[label] if isinstance(label, int) and label >= 0 and label < len(candidates) else ""
-    option_str = " ".join([f"({chr(65+i)}) {cand}" for i, cand in enumerate(candidates)])
-    return f"Case context: {context}\nQuestion: {question}\nOptions: {option_str}\nCorrect answer: {labeled_answer}"
+    labeled_answer = (
+        candidates[label]
+        if isinstance(label, int) and 0 <= label < len(candidates)
+        else ""
+    )
+    option_str = " ".join(
+        [f"({chr(65 + i)}) {cand}" for i, cand in enumerate(candidates)]
+    )
+    return (
+        f"Case context: {context}\n"
+        f"Question: {question}\n"
+        f"Options: {option_str}\n"
+        f"Correct answer: {labeled_answer}"
+    )
 
 
 def gsm8k_template(example: Dict) -> str:
@@ -71,13 +89,49 @@ def gsm8k_template(example: Dict) -> str:
     return f"Problem: {question}\nSolution: {answer}"
 
 
+def _pubmedqa_context_to_text(ctx: Any) -> str:
+    """
+    PubMedQA 'context' field is often a dict with 'contexts' list.
+    Fall back gracefully if it's already a string.
+    """
+    if isinstance(ctx, dict):
+        contexts = ctx.get("contexts") or []
+        if isinstance(contexts, list):
+            return " ".join(str(c) for c in contexts)
+        else:
+            return str(contexts)
+    return str(ctx)
+
+
+def pubmedqa_template(example: Dict) -> str:
+    """
+    Training template for PubMedQA.
+
+    We include the *final_decision* in the text, since training is LM-style.
+    Evaluation for yes/no will instead stop before the answer token.
+    """
+    question = example.get("question", "")
+    ctx_text = _pubmedqa_context_to_text(example.get("context", ""))
+    decision = example.get("final_decision", "")
+    return (
+        f"Context: {ctx_text}\n"
+        f"Question: {question}\n"
+        f"Answer: {decision}"
+    )
+
+
 def generic_template(example: Dict) -> str:
     # Fallback if we do not know the schema
-    parts = [f"{k}: {v}" for k, v in example.items() if isinstance(v, (str, int, float))]
+    parts = [f"{k}: {v}" for k, v in example.items()
+             if isinstance(v, (str, int, float))]
     return "\n".join(parts)
 
 
 # Mapping from high-level domain names to datasets and templates
+#
+# For PubMedQA we explicitly use:
+#   - train   → pqa_artificial
+#   - val/test→ pqa_labeled (so eval is on labeled questions)
 DOMAIN_SPECS: Dict[str, Dict] = {
     "biomed": {
         "dataset": "openlifescienceai/medmcqa",
@@ -93,6 +147,16 @@ DOMAIN_SPECS: Dict[str, Dict] = {
         "dataset": "openai/gsm8k",
         "subset": "main",
         "template": gsm8k_template,
+    },
+    "pubmedqa": {
+        "dataset": "qiaojin/PubMedQA",
+        # Config per split
+        "subset": {
+            "train": "pqa_artificial",
+            "validation": "pqa_labeled",
+            "test": "pqa_labeled",
+        },
+        "template": pubmedqa_template,
     },
 }
 
@@ -112,11 +176,24 @@ class DomainSequenceDataset(Dataset):
         split: str = "train",
     ):
         if domain not in DOMAIN_SPECS:
-            raise ValueError(f"Unknown domain '{domain}'. Available: {list(DOMAIN_SPECS.keys())}")
+            raise ValueError(
+                f"Unknown domain '{domain}'. Available: {list(DOMAIN_SPECS.keys())}"
+            )
 
         spec = DOMAIN_SPECS[domain]
         self.template_fn: Callable[[Dict], str] = spec["template"]
-        self.dataset = load_dataset(spec["dataset"], spec["subset"], split=split)
+
+        subset_cfg = spec.get("subset")
+        if isinstance(subset_cfg, dict):
+            hf_subset = subset_cfg.get(split, None)
+        else:
+            hf_subset = subset_cfg
+
+        # hf_subset may be None (default config)
+        if hf_subset is None:
+            self.dataset = load_dataset(spec["dataset"], split=split)
+        else:
+            self.dataset = load_dataset(spec["dataset"], hf_subset, split=split)
 
         self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
         if self.tokenizer.pad_token is None:
@@ -175,9 +252,10 @@ class DomainMemoryConfig:
     neural_memory_batch_size: Optional[int] = 64
 
 
-def _titan_config_from_checkpoint(checkpoint_cfg: Dict, cli_cfg: DomainMemoryConfig) -> TitanLLaMAConfig:
+def _titan_config_from_checkpoint(
+    checkpoint_cfg: Dict, cli_cfg: DomainMemoryConfig
+) -> TitanLLaMAConfig:
     """Rehydrate Titan config from a training checkpoint dict."""
-    # Use stored training config when available, otherwise fall back to defaults
     def _get(key, default):
         return checkpoint_cfg.get(key, default)
 
@@ -187,7 +265,9 @@ def _titan_config_from_checkpoint(checkpoint_cfg: Dict, cli_cfg: DomainMemoryCon
         intermediate_size=_get("intermediate_size", 11008),
         num_hidden_layers=_get("num_hidden_layers", 32),
         num_attention_heads=_get("num_attention_heads", 32),
-        num_key_value_heads=_get("num_key_value_heads", _get("num_attention_heads", 32)),
+        num_key_value_heads=_get(
+            "num_key_value_heads", _get("num_attention_heads", 32)
+        ),
         max_position_embeddings=_get("max_position_embeddings", 2048),
         segment_len=_get("segment_len", 512),
         num_persist_mem_tokens=_get("num_persist_mem_tokens", 4),
@@ -211,16 +291,16 @@ def load_domain_model(cfg: DomainMemoryConfig) -> TitanLLaMAForCausalLM:
     Load Titan-LLaMA either from a prior checkpoint (preferred) or directly from HF weights.
     Only NeuralMemory parameters will be left trainable.
     """
-    model = None
-
     if cfg.base_checkpoint and os.path.exists(cfg.base_checkpoint):
         print(f"Loading base checkpoint from {cfg.base_checkpoint}")
         ckpt = torch.load(cfg.base_checkpoint, map_location="cpu")
+        print("Loaded checkpoint. Keys:", ckpt.keys(), flush=True)
         ckpt_cfg = ckpt.get("config", {})
         titan_cfg = _titan_config_from_checkpoint(ckpt_cfg, cfg)
         model = TitanLLaMAForCausalLM(titan_cfg)
         state = ckpt.get("model_state_dict") or ckpt
         missing, unexpected = model.load_state_dict(state, strict=False)
+        print("Finished load_state_dict.", flush=True)
         if missing:
             print(f"[warn] Missing keys when loading checkpoint: {missing}")
         if unexpected:
@@ -245,7 +325,7 @@ def load_domain_model(cfg: DomainMemoryConfig) -> TitanLLaMAForCausalLM:
             dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32,
             device_map="auto",
         )
-        # Reset default device to CPU so dataloaders and torch.randperm stay on CPU
+        # Keep dataloader internals on CPU to avoid generator/device mismatch
         try:
             torch.set_default_device("cpu")
         except Exception:
@@ -271,18 +351,102 @@ def evaluate(model, dataloader, device):
         for batch in dataloader:
             input_ids = batch["input_ids"].to(device)
             labels = batch["labels"].to(device)
-            model.reset_memory_states()
+            if hasattr(model, "reset_memory_states"):
+                model.reset_memory_states()
             outputs = model(input_ids=input_ids, labels=labels)
             total_loss += outputs["loss"].item()
             total_acc += outputs.get("correct", 0.0)
             steps += 1
     model.train()
-    return {
-        "loss": total_loss / max(steps, 1),
-        "ppl": math.exp(total_loss / max(steps, 1)) if steps > 0 else float("inf"),
-        "acc": (total_acc / max(steps, 1)).item() if steps > 0 else 0.0,
-    }
+    avg_loss = total_loss / max(steps, 1)
+    ppl = math.exp(avg_loss) if steps > 0 else float("inf")
+    acc = (total_acc / max(steps, 1)).item() if steps > 0 else 0.0
+    return {"loss": avg_loss, "ppl": ppl, "acc": acc}
 
+
+# ---------------------------------------------------------------------------
+# PubMedQA yes/no evaluation on pqa_labeled
+# ---------------------------------------------------------------------------
+
+def evaluate_pubmedqa_yesno(model, cfg: DomainMemoryConfig) -> float:
+    """
+    Evaluate yes/no accuracy on PubMedQA pqa_labeled.
+
+    We:
+    - load config 'pqa_labeled'
+    - filter to final_decision in {yes,no}
+    - prompt the model with context + question and ask "Answer (yes or no):"
+    - greedy-generate 1 token and map to yes/no.
+    """
+    print("[PubMedQA] Running yes/no evaluation on pqa_labeled...")
+    tokenizer = AutoTokenizer.from_pretrained(cfg.tokenizer_name)
+
+    ds = load_dataset("qiaojin/PubMedQA", "pqa_labeled", split="train")
+
+    def is_yesno(ex):
+        return ex.get("final_decision") in ("yes", "no")
+
+    ds = ds.filter(is_yesno)
+
+    model.eval()
+    correct = 0
+    total = 0
+
+    for ex in ds:
+        ctx_text = _pubmedqa_context_to_text(ex.get("context", ""))
+        question = ex.get("question", "")
+        gold = ex.get("final_decision")
+
+        prompt = (
+            f"Context: {ctx_text}\n"
+            f"Question: {question}\n"
+            f"Answer (yes or no):"
+        )
+
+        enc = tokenizer(
+            prompt,
+            return_tensors="pt",
+            truncation=True,
+            max_length=cfg.max_length,
+        ).to(cfg.device)
+
+        if hasattr(model, "reset_memory_states"):
+            model.reset_memory_states()
+
+        with torch.no_grad():
+            out = model.generate(
+                **enc,
+                max_new_tokens=1,
+                do_sample=False,
+            )
+
+        new_ids = out[0, enc["input_ids"].shape[-1]:]
+        text = tokenizer.decode(new_ids, skip_special_tokens=True).strip().lower()
+
+        if text.startswith("yes"):
+            pred = "yes"
+        elif text.startswith("no"):
+            pred = "no"
+        else:
+            pred = None  # weird response → treat as incorrect
+
+        if pred is not None:
+            if pred == gold:
+                correct += 1
+            total += 1
+
+    acc = correct / total if total > 0 else 0.0
+    print(
+        f"[PubMedQA] yes/no accuracy on pqa_labeled: "
+        f"{acc:.4f} ({correct}/{total} counted examples)"
+    )
+    model.train()
+    return acc
+
+
+# ---------------------------------------------------------------------------
+# Training loop
+# ---------------------------------------------------------------------------
 
 def train_domain_memory(cfg: DomainMemoryConfig):
     os.makedirs(cfg.output_dir, exist_ok=True)
@@ -302,6 +466,7 @@ def train_domain_memory(cfg: DomainMemoryConfig):
     )
 
     # Try validation, fall back to test/train as needed
+    eval_ds = None
     for candidate_split in ["validation", "test", "train"]:
         try:
             eval_ds = DomainSequenceDataset(
@@ -317,14 +482,16 @@ def train_domain_memory(cfg: DomainMemoryConfig):
     if eval_ds is None:
         raise RuntimeError(f"Could not create evaluation dataset for domain {cfg.domain}")
 
-    train_loader = DataLoader(train_ds, batch_size=cfg.batch_size, shuffle=True)
-    eval_loader = DataLoader(eval_ds, batch_size=cfg.eval_batch_size, shuffle=False)
+    # train_loader = DataLoader(train_ds, batch_size=cfg.batch_size, shuffle=True)
+    # eval_loader = DataLoader(eval_ds, batch_size=cfg.eval_batch_size, shuffle=False)
+    train_loader = DataLoader(train_ds,batch_size=cfg.batch_size,shuffle=True,num_workers=4,pin_memory=True,)
+    eval_loader = DataLoader(eval_ds,batch_size=cfg.eval_batch_size,shuffle=False,num_workers=4,pin_memory=True,)
 
     global_step = 0
     model.train()
 
     for epoch in range(cfg.num_epochs):
-        print(f"Epoch {epoch+1}/{cfg.num_epochs}")
+        print(f"Epoch {epoch + 1}/{cfg.num_epochs}")
         for step, batch in enumerate(train_loader):
             if cfg.steps_per_epoch and step >= cfg.steps_per_epoch:
                 break
@@ -332,7 +499,9 @@ def train_domain_memory(cfg: DomainMemoryConfig):
             input_ids = batch["input_ids"].to(cfg.device)
             labels = batch["labels"].to(cfg.device)
 
-            model.reset_memory_states()
+            if hasattr(model, "reset_memory_states"):
+                model.reset_memory_states()
+
             outputs = model(input_ids=input_ids, labels=labels)
             loss = outputs["loss"]
             loss.backward()
@@ -346,9 +515,19 @@ def train_domain_memory(cfg: DomainMemoryConfig):
 
             if cfg.eval_every and global_step > 0 and global_step % cfg.eval_every == 0:
                 metrics = evaluate(model, eval_loader, cfg.device)
-                print(f"[eval] step {global_step} | loss {metrics['loss']:.4f} | ppl {metrics['ppl']:.2f} | acc {metrics['acc']:.4f}")
-                save_path = os.path.join(cfg.output_dir, f"{cfg.domain}-nmm-step{global_step}.pt")
-                torch.save({"model_state_dict": model.state_dict(), "config": cfg.__dict__}, save_path)
+                print(
+                    f"[eval] step {global_step} | "
+                    f"loss {metrics['loss']:.4f} | "
+                    f"ppl {metrics['ppl']:.2f} | "
+                    f"acc {metrics['acc']:.4f}"
+                )
+                save_path = os.path.join(
+                    cfg.output_dir, f"{cfg.domain}-nmm-step{global_step}.pt"
+                )
+                torch.save(
+                    {"model_state_dict": model.state_dict(), "config": cfg.__dict__},
+                    save_path,
+                )
                 print(f"Saved checkpoint to {save_path}")
 
             global_step += 1
@@ -358,15 +537,21 @@ def train_domain_memory(cfg: DomainMemoryConfig):
     torch.save({"model_state_dict": model.state_dict(), "config": cfg.__dict__}, final_path)
     print(f"Finished training. Final checkpoint: {final_path}")
 
+    # Extra: PubMedQA yes/no evaluation if requested domain
+    if cfg.domain == "pubmedqa":
+        evaluate_pubmedqa_yesno(model, cfg)
+
 
 def parse_args() -> DomainMemoryConfig:
-    parser = argparse.ArgumentParser(description="Train domain-specific NeuralMemory adapter.")
+    parser = argparse.ArgumentParser(
+        description="Train domain-specific NeuralMemory adapter."
+    )
     parser.add_argument("--domain", required=True, choices=list(DOMAIN_SPECS.keys()))
     parser.add_argument("--tokenizer_name", default="meta-llama/Meta-Llama-3.1-8B")
     parser.add_argument("--base_model_name", default="meta-llama/Meta-Llama-3.1-8B")
     parser.add_argument("--base_checkpoint", default="./titan_llama_checkpoints/best_checkpoint.pt")
     parser.add_argument("--output_dir", default="./domain_nmm")
-    parser.add_argument("--max_length", type=int, default=1024)
+    parser.add_argument("--max_length", type=int, default=256)
     parser.add_argument("--batch_size", type=int, default=2)
     parser.add_argument("--eval_batch_size", type=int, default=2)
     parser.add_argument("--num_epochs", type=int, default=1)
