@@ -103,19 +103,28 @@ def compute_attention_distillation_loss(model, input_ids, attention_mask, distil
             # Normalize input (as done in the layer)
             normalized_input = layer.input_layernorm(layer_input)
             
+            # Determine if this layer expects value residual
+            # Layer 0 doesn't accept value residual, others do
+            if hasattr(attn_module, 'to_learned_v_mix') and attn_module.to_learned_v_mix is not None:
+                # This layer expects value residual - create a dummy one
+                value_residual_input = torch.zeros_like(normalized_input)
+            else:
+                # This layer doesn't expect value residual
+                value_residual_input = None
+            
             # Target: attention without flex attention (more basic implementation)
             with torch.no_grad():
                 attn_target, _ = attn_module(
                     normalized_input,
                     disable_flex_attn=True,
-                    value_residual=None
+                    value_residual=value_residual_input
                 )
             
             # Student: attention with flex attention enabled
             attn_output, _ = attn_module(
                 normalized_input, 
                 disable_flex_attn=False,
-                value_residual=None
+                value_residual=value_residual_input
             )
             
             # Compute MSE loss between outputs
