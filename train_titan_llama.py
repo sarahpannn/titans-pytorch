@@ -51,7 +51,7 @@ from simple_eval import eval_winogrande_boolq, quick_eval_boolq, should_run_inte
 def compute_attention_distillation_loss(model, input_ids, attention_mask, distillation_layers, device):
     """
     Compute attention distillation loss by comparing segmented attention outputs
-    with and without flex attention optimizations or neural memory features.
+    with and without flex attention optimizations.
     """
     total_distill_loss = 0.0
     num_layers = len(distillation_layers)
@@ -66,35 +66,45 @@ def compute_attention_distillation_loss(model, input_ids, attention_mask, distil
     
     transformer_layers = base_model.model.layers
     
-    # Run a forward pass to get intermediate hidden states
+    # Run a forward pass to collect hidden states and value residuals
     with torch.no_grad():
-        # Get embeddings
         inputs_embeds = base_model.model.embed_tokens(input_ids)
         hidden_states = inputs_embeds
+        value_residual = None
         
-        # Store hidden states for distillation layers
-        layer_hidden_states = {}
+        # Store states for distillation layers  
+        layer_states = {}
         
         for layer_idx, layer in enumerate(transformer_layers):
             if layer_idx in distillation_layers:
-                layer_hidden_states[layer_idx] = hidden_states.clone()
+                # Store both the input hidden state and current value residual
+                layer_states[layer_idx] = {
+                    'hidden_states': hidden_states.clone(),
+                    'value_residual': value_residual.clone() if value_residual is not None else None
+                }
             
-            # Forward through layer
+            # Forward through layer to get next states
             layer_outputs = layer(
                 hidden_states,
                 attention_mask=attention_mask,
                 use_cache=False,
                 output_attentions=False,
+                value_residual=value_residual,
             )
             hidden_states = layer_outputs[0]
+            # Extract value residual for next layer (second to last output)
+            if len(layer_outputs) >= 2:
+                value_residual = layer_outputs[-2]  # value_residual is second to last
     
     # Now compute distillation loss for each specified layer
     for layer_idx in distillation_layers:
-        if layer_idx >= len(transformer_layers) or layer_idx not in layer_hidden_states:
+        if layer_idx >= len(transformer_layers) or layer_idx not in layer_states:
             continue
             
         layer = transformer_layers[layer_idx]
-        layer_input = layer_hidden_states[layer_idx]
+        states = layer_states[layer_idx]
+        layer_input = states['hidden_states']
+        layer_value_residual = states['value_residual']
         
         # Get the segmented attention module
         if hasattr(layer, 'self_attn') and hasattr(layer.self_attn, 'segmented_attn'):
@@ -103,28 +113,19 @@ def compute_attention_distillation_loss(model, input_ids, attention_mask, distil
             # Normalize input (as done in the layer)
             normalized_input = layer.input_layernorm(layer_input)
             
-            # Determine if this layer expects value residual
-            # Layer 0 doesn't accept value residual, others do
-            if hasattr(attn_module, 'to_learned_v_mix') and attn_module.to_learned_v_mix is not None:
-                # This layer expects value residual - create a dummy one
-                value_residual_input = torch.zeros_like(normalized_input)
-            else:
-                # This layer doesn't expect value residual
-                value_residual_input = None
-            
             # Target: attention without flex attention (more basic implementation)
             with torch.no_grad():
                 attn_target, _ = attn_module(
                     normalized_input,
                     disable_flex_attn=True,
-                    value_residual=value_residual_input
+                    value_residual=layer_value_residual
                 )
             
             # Student: attention with flex attention enabled
             attn_output, _ = attn_module(
                 normalized_input, 
                 disable_flex_attn=False,
-                value_residual=value_residual_input
+                value_residual=layer_value_residual
             )
             
             # Compute MSE loss between outputs
