@@ -67,6 +67,7 @@ def parse_args():
     
     # Resume training
     parser.add_argument("--resume_from_checkpoint", type=str, default=None, help="Resume from checkpoint")
+    parser.add_argument("--pretrained_from_checkpoint", type=str, default=None, help="Initialize model weights from this checkpoint but start training from step 0.")
     
     # Other options
     parser.add_argument("--no_wandb", action="store_true", help="Disable wandb logging")
@@ -130,6 +131,7 @@ def create_config_from_args(args):
         
         # Resume config
         resume_from_checkpoint=args.resume_from_checkpoint,
+        pretrained_from_checkpoint=args.pretrained_from_checkpoint,
     )
     
     # Debug mode adjustments

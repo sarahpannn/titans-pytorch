@@ -45,7 +45,7 @@ class TitanLLaMAConfig:
         neural_memory_depth: int = 2,
         use_flex_attn: bool = True,
         sliding_window_attn: bool = True,
-        neural_mem_gate_attn_output: bool = False,
+        neural_mem_gate_attn_output: bool = True,
         neural_mem_weight_residual: bool = True,
         neural_mem_qkv_receives_diff_view: bool = True,
         # Pretrained backbone support
