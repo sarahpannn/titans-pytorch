@@ -9,7 +9,7 @@ from torch.utils.data import Dataset as TorchDataset
 
 
 class FineWebEduDataset(TorchDataset):
-    """Dataset class for FineWeb-Edu tokenized data."""
+    """Dataset class for FineWeb-Edu tokenized data, BoolQ-style outputs."""
 
     def __init__(
         self,
@@ -18,45 +18,51 @@ class FineWebEduDataset(TorchDataset):
         max_length: int = 2048,
         streaming: bool = True,
         split: str = "train",
-        num_proc: bool = 8
+        num_proc: int = 8,   # kept for API compatibility
+        max_examples: int | None = None,  # only used when streaming=False
     ):
         self.max_length = max_length
+        self.streaming = streaming
         self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
 
-        # Set padding token if not set
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
 
-        print(f"Loading dataset {dataset_name}...")
+        print(f"Loading dataset {dataset_name} (split: {split}, streaming={streaming})...")
 
-        # FineWeb-Edu's main text field is usually "text"
         self.dataset = load_dataset(
             dataset_name,
             split=split,
             streaming=streaming,
-            # trust_remote_code=True,  # usually not needed here
         )
 
-        print("Dataset loaded successfully")
+        # If not streaming, we can optionally truncate by examples and use real __len__
+        if not streaming and max_examples is not None:
+            self.dataset = self.dataset.select(
+                range(min(max_examples, len(self.dataset)))
+            )
 
-        # For demo / small runs, take a subset if streaming
         if streaming:
-            # Adjust this as you like for your token budget
+            # Take a finite slice of the stream
             self.dataset = self.dataset.take(500_000)
 
-        print("Done taking from stream (if streaming)")
+        print("FineWeb-Edu dataset loaded successfully")
 
     def __len__(self):
-        # For streaming datasets, __len__ is not well-defined;
-        # return a large approximate number.
-        return 1_000_000
+        if self.streaming:
+            # approximate, like before
+            return 1_000_000
+        else:
+            return len(self.dataset)
 
     def __getitem__(self, idx):
         try:
-            # Get the idx-th element in a streaming-safe way
-            item = next(iter(self.dataset.skip(idx).take(1)))
+            if self.streaming:
+                # streaming-safe access
+                item = next(iter(self.dataset.skip(idx).take(1)))
+            else:
+                item = self.dataset[idx]
 
-            # FineWeb-Edu stores the main content under "text"
             text = item.get("text", "")
 
             tokens = self.tokenizer(
@@ -67,17 +73,24 @@ class FineWebEduDataset(TorchDataset):
                 return_tensors="pt",
             )
 
-            input_ids = tokens["input_ids"].squeeze(0)
-            attention_mask = tokens["attention_mask"].squeeze(0)
+            # Force everything to CPU, matching BoolQ style
+            input_ids = tokens["input_ids"].squeeze(0).to("cpu", non_blocking=False)
+            attention_mask = tokens["attention_mask"].squeeze(0).to("cpu", non_blocking=False)
+
+            labels = input_ids.clone()  # CPU
+
+            assert input_ids.device.type == "cpu"
+            assert attention_mask.device.type == "cpu"
+            assert labels.device.type == "cpu"
 
             return {
                 "input_ids": input_ids,
                 "attention_mask": attention_mask,
-                "labels": input_ids.clone(),
+                "labels": labels,
             }
 
         except Exception as e:
-            # Fallback dummy batch on any error
+            # Fallback dummy batch on any error (also CPU)
             dummy_ids = torch.full(
                 (self.max_length,),
                 self.tokenizer.pad_token_id,
@@ -94,75 +107,86 @@ class FineWebEduDataset(TorchDataset):
                 "labels": dummy_ids.clone(),
             }
 
+
 class SlimPajamaDataset(TorchDataset):
-    """Dataset class for SlimPajama tokenized data."""
-    
+    """Dataset class for SlimPajama tokenized data, BoolQ-style outputs."""
+
     def __init__(
-        self, 
+        self,
         dataset_name: str = "cerebras/SlimPajama-627B",
-        tokenizer_name: str = "meta-llama/Meta-Llama-3.1-8B", 
+        tokenizer_name: str = "meta-llama/Meta-Llama-3.1-8B",
         max_length: int = 2048,
         streaming: bool = True,
         split: str = "train",
-        num_proc: int = 8
+        num_proc: int = 8,   # kept for API compatibility
+        max_examples: int | None = None,  # only for non-streaming
     ):
         self.max_length = max_length
+        self.streaming = streaming
         self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
-        
-        # Set padding token if not set
+
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
-            
-        print(f"Loading dataset {dataset_name}...")
-        
-        # Load dataset in streaming mode for large datasets
+
+        print(f"Loading dataset {dataset_name} (split: {split}, streaming={streaming}).")
+
         self.dataset = load_dataset(
             dataset_name,
             split=split,
             streaming=streaming,
-            # trust_remote_code=True
         )
 
-        print("Dataset loaded successfully")
-        
-        # For demonstration, we'll take a subset for the 1B token target
-        # In practice, you'd want to configure this based on your compute
+        # For non-streaming, allow truncation by max_examples
+        if not streaming and max_examples is not None:
+            self.dataset = self.dataset.select(
+                range(min(max_examples, len(self.dataset)))
+            )
+
         if streaming:
-            # Take first portion of the dataset
-            self.dataset = self.dataset.take(500000)  # Approximate for 1B tokens
-        
-        print("Done taking from stream")
-    
+            self.dataset = self.dataset.take(500_000)
+
+        print("SlimPajama dataset loaded successfully")
+
     def __len__(self):
-        # For streaming dataset, return a large number
-        return 1000000  # Approximate
-    
+        if self.streaming:
+            return 1_000_000
+        else:
+            return len(self.dataset)
+
     def __getitem__(self, idx):
         try:
-            # Get next item from streaming dataset
-            item = next(iter(self.dataset.skip(idx).take(1)))
-            text = item['text']
-            
-            # Tokenize
+            if self.streaming:
+                item = next(iter(self.dataset.skip(idx).take(1)))
+            else:
+                item = self.dataset[idx]
+
+            text = item.get("text", "")
+
             tokens = self.tokenizer(
                 text,
                 max_length=self.max_length,
                 padding="max_length",
                 truncation=True,
-                return_tensors="pt"
+                return_tensors="pt",
             )
-            
-            input_ids = tokens['input_ids'].squeeze()
-            attention_mask = tokens['attention_mask'].squeeze()
-            
+
+            # Force CPU tensors, just like BoolQ/Winogrande
+            input_ids = tokens["input_ids"].squeeze(0).to("cpu", non_blocking=False)
+            attention_mask = tokens["attention_mask"].squeeze(0).to("cpu", non_blocking=False)
+
+            labels = input_ids.clone()
+
+            assert input_ids.device.type == "cpu"
+            assert attention_mask.device.type == "cpu"
+            assert labels.device.type == "cpu"
+
             return {
-                'input_ids': input_ids,
-                'attention_mask': attention_mask,
-                'labels': input_ids.clone()
+                "input_ids": input_ids,
+                "attention_mask": attention_mask,
+                "labels": labels,
             }
-            
+
         except Exception as e:
-            # Return a dummy batch if there's an error
             dummy_ids = torch.full(
                 (self.max_length,),
                 self.tokenizer.pad_token_id,
@@ -170,26 +194,25 @@ class SlimPajamaDataset(TorchDataset):
                 device="cpu",
             )
             return {
-            'input_ids': dummy_ids,
-            'attention_mask': torch.zeros(
-                self.max_length,
-                dtype=torch.long,
-                device="cpu",
-            ),
-            'labels': dummy_ids.clone(),
-        }
-
+                "input_ids": dummy_ids,
+                "attention_mask": torch.zeros(
+                    self.max_length,
+                    dtype=torch.long,
+                    device="cpu",
+                ),
+                "labels": dummy_ids.clone(),
+            }
 
 
 class BoolQDataset(TorchDataset):
-    """BoolQ as prompt + yes/no answer, with loss only on the answer tokens."""
+    """Dataset class for BoolQ tokenized data, same style as FineWebEdu/SlimPajama."""
 
     def __init__(
         self,
         tokenizer_name: str = "meta-llama/Meta-Llama-3.1-8B",
         max_length: int = 2048,
         split: str = "train",
-        num_proc: int = 8,           # kept for API compatibility, not used
+        num_proc: int = 8,        # kept for API compatibility
         max_examples: int | None = None,
     ):
         self.max_length = max_length
@@ -202,12 +225,11 @@ class BoolQDataset(TorchDataset):
         self.dataset = load_dataset("google/boolq", split=split)
 
         if max_examples is not None:
-            self.dataset = self.dataset.select(range(min(max_examples, len(self.dataset))))
+            self.dataset = self.dataset.select(
+                range(min(max_examples, len(self.dataset)))
+            )
 
         print(f"BoolQ dataset loaded: {len(self.dataset)} examples")
-
-        self.yes_id = self.tokenizer.encode(" yes", add_special_tokens=False)[0]
-        self.no_id  = self.tokenizer.encode(" no",  add_special_tokens=False)[0]
 
     def __len__(self):
         return len(self.dataset)
@@ -217,60 +239,31 @@ class BoolQDataset(TorchDataset):
 
         passage = item["passage"]
         question = item["question"]
-        answer = bool(item["answer"])  # True/False
+        answer = bool(item["answer"])
 
-        prompt = f"Passage: {passage}\nQuestion: {question}\nAnswer (yes or no):"
-        target_answer = " yes" if answer else " no"
-        full_text = prompt + target_answer
+        text = (
+            f"Passage: {passage}\n"
+            f"Question: {question}\n"
+            f"Answer (yes or no): {'yes' if answer else 'no'}"
+        )
 
         tokens = self.tokenizer(
-            full_text,
+            text,
             max_length=self.max_length,
             padding="max_length",
             truncation=True,
             return_tensors="pt",
-            add_special_tokens=True,
         )
 
-        # Force to CPU in case default tensor device is CUDA
-        input_ids = tokens["input_ids"].squeeze(0).to("cpu")
-        attention_mask = tokens["attention_mask"].squeeze(0).to("cpu")
+        # Force everything to CPU, even if some global default made it CUDA
+        input_ids = tokens["input_ids"].squeeze(0).to("cpu", non_blocking=False)
+        attention_mask = tokens["attention_mask"].squeeze(0).to("cpu", non_blocking=False)
 
-        # Safety: ensure exact length
-        if input_ids.shape[0] != self.max_length:
-            if input_ids.shape[0] < self.max_length:
-                pad_len = self.max_length - input_ids.shape[0]
-                pad_ids = torch.full(
-                    (pad_len,),
-                    self.tokenizer.pad_token_id,
-                    dtype=input_ids.dtype,
-                    device="cpu",
-                )
-                pad_mask = torch.zeros(
-                    pad_len,
-                    dtype=attention_mask.dtype,
-                    device="cpu",
-                )
-                input_ids = torch.cat([input_ids, pad_ids], dim=0)
-                attention_mask = torch.cat([attention_mask, pad_mask], dim=0)
-            else:
-                input_ids = input_ids[: self.max_length]
-                attention_mask = attention_mask[: self.max_length]
+        labels = input_ids.clone()  # already CPU
 
-        # Prompt length for masking labels
-        prompt_only_tokens = self.tokenizer(
-            prompt,
-            truncation=True,
-            add_special_tokens=True,
-            return_tensors="pt",
-        )
-        prompt_length = prompt_only_tokens["input_ids"].shape[1]
+        # Optional debug: uncomment if you want to confirm devices
+        # print("BoolQ devices:", input_ids.device, attention_mask.device, labels.device)
 
-        labels = input_ids.clone()
-        if prompt_length < labels.shape[0]:
-            labels[:prompt_length] = -100
-
-        # Final sanity
         assert input_ids.device.type == "cpu"
         assert attention_mask.device.type == "cpu"
         assert labels.device.type == "cpu"
@@ -283,6 +276,8 @@ class BoolQDataset(TorchDataset):
             "attention_mask": attention_mask,
             "labels": labels,
         }
+
+
 
 class WinograndeDataset(TorchDataset):
     """

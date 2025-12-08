@@ -511,26 +511,27 @@ def evaluate_model(model, eval_dataloader, device, max_eval_steps=100):
         }
 
 
-def main():
+def main(config=None):
     """Main training function."""
     
-    # Parse command line arguments
-    parser = argparse.ArgumentParser(description="Train TitanLLaMA with optional attention distillation")
-    parser.add_argument("--use-attention-distillation", action="store_true", 
-                       help="Enable attention distillation loss")
-    parser.add_argument("--distillation-weight", type=float, default=0.1,
-                       help="Weight for distillation loss vs LM loss (default: 0.1)")
-    parser.add_argument("--distillation-layers", nargs="+", type=int, default=[8, 16, 24],
-                       help="Which layers to apply distillation to (default: 8 16 24)")
-    
-    args = parser.parse_args()
-    
-    # Create config with command-line overrides
-    config = TrainingConfig(
-        use_attention_distillation=args.use_attention_distillation,
-        distillation_weight=args.distillation_weight,
-        distillation_layers=tuple(args.distillation_layers)
-    )
+    if config is None:
+        # Parse command line arguments
+        parser = argparse.ArgumentParser(description="Train TitanLLaMA with optional attention distillation")
+        parser.add_argument("--use-attention-distillation", action="store_true", 
+                           help="Enable attention distillation loss")
+        parser.add_argument("--distillation-weight", type=float, default=0.1,
+                           help="Weight for distillation loss vs LM loss (default: 0.1)")
+        parser.add_argument("--distillation-layers", nargs="+", type=int, default=[8, 16, 24],
+                           help="Which layers to apply distillation to (default: 8 16 24)")
+        
+        args = parser.parse_args()
+        
+        # Create config with command-line overrides
+        config = TrainingConfig(
+            use_attention_distillation=args.use_attention_distillation,
+            distillation_weight=args.distillation_weight,
+            distillation_layers=tuple(args.distillation_layers)
+        )
     
     # Set up logging
     logger = setup_logging(config)
@@ -626,21 +627,6 @@ def main():
             winogrande_split="validation" if "validation" in ["train"] else "train",  # Use train split for now
         )
 
-    elif 'mixed' in config.dataset_name:
-        train_dataset = MixedEvalDataset(
-            tokenizer_name=config.tokenizer_name,
-            max_length=config.sequence_length,
-            boolq_split="train", 
-            winogrande_split="train",
-        )
-
-        eval_dataset = MixedEvalDataset(
-            tokenizer_name=config.tokenizer_name,
-            max_length=config.sequence_length,
-            boolq_split="validation" if "validation" in ["train"] else "train",  # Use train split for now 
-            winogrande_split="validation" if "validation" in ["train"] else "train",  # Use train split for now
-        )
-
     else: raise RuntimeError("Could not infer dataset")
 
     print("THIS IS THE MICRO BS FROM CFG: ", config.micro_batch_size)
@@ -661,6 +647,12 @@ def main():
         num_workers=0,  # Set to 0 to avoid multiprocessing issues with HF datasets
         pin_memory=True
     )
+
+    model, optimizer, scheduler = create_model_and_optimizer(config, device)
+
+    tokenizer = AutoTokenizer.from_pretrained(config.tokenizer_name)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
     
     # Resume from checkpoint if specified
     start_step = 0
