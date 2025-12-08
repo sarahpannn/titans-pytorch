@@ -231,59 +231,53 @@ class BoolQDataset(TorchDataset):
             prompt = f"Passage: {passage}\nQuestion: {question}\nAnswer (yes or no):"
             target_answer = " yes" if answer else " no"
             
-            # First tokenize prompt to get its length
-            prompt_tokens = self.tokenizer(
-                prompt,
+            # Simplified approach: tokenize full text and handle truncation properly
+            full_text = prompt + target_answer
+            
+            # Tokenize full text with proper settings
+            tokens = self.tokenizer(
+                full_text,
+                max_length=self.max_length,
+                padding="max_length",
                 truncation=True,
                 return_tensors="pt",
                 add_special_tokens=True
             )
-            prompt_length = prompt_tokens['input_ids'].shape[1]
             
-            # Reserve space for the answer (typically just 1-2 tokens)
-            max_prompt_length = self.max_length - 5  # Reserve space for answer + EOS
+            # Extract tensors and ensure proper shape
+            input_ids = tokens['input_ids'].squeeze(0)  # Remove batch dimension
+            attention_mask = tokens['attention_mask'].squeeze(0)
             
-            # Tokenize prompt with length limit
-            if prompt_length > max_prompt_length:
-                prompt_tokens = self.tokenizer(
-                    prompt,
-                    max_length=max_prompt_length,
-                    truncation=True,
-                    padding=False,
-                    return_tensors="pt",
-                    add_special_tokens=True
-                )
-            
-            # Tokenize answer separately
-            answer_tokens = self.tokenizer(
-                target_answer,
-                add_special_tokens=False,
-                return_tensors="pt"
-            )
-            
-            # Combine prompt + answer
-            input_ids = torch.cat([
-                prompt_tokens['input_ids'].squeeze(0),
-                answer_tokens['input_ids'].squeeze(0)
-            ], dim=0)
-            
-            # Pad to max_length
-            if len(input_ids) < self.max_length:
-                padding_length = self.max_length - len(input_ids)
-                input_ids = torch.cat([
-                    input_ids,
-                    torch.full((padding_length,), self.tokenizer.pad_token_id, dtype=torch.long)
-                ], dim=0)
-            else:
-                input_ids = input_ids[:self.max_length]
-            
-            # Create attention mask
-            attention_mask = (input_ids != self.tokenizer.pad_token_id).long()
+            # Ensure tensors are exactly max_length
+            if input_ids.shape[0] != self.max_length:
+                # This shouldn't happen with padding="max_length", but just in case
+                if input_ids.shape[0] < self.max_length:
+                    pad_length = self.max_length - input_ids.shape[0]
+                    input_ids = torch.cat([input_ids, torch.full((pad_length,), self.tokenizer.pad_token_id, device="cpu")])
+                    attention_mask = torch.cat([attention_mask, torch.zeros(pad_length, dtype=torch.long, device="cpu")])
+                else:
+                    input_ids = input_ids[:self.max_length]
+                    attention_mask = attention_mask[:self.max_length]
             
             # Create labels: mask the prompt part, only train on the answer
+            # Tokenize just the prompt to find where it ends
+            prompt_only_tokens = self.tokenizer(
+                prompt,
+                truncation=True,
+                add_special_tokens=True
+            )
+            prompt_length = len(prompt_only_tokens['input_ids'])
+            
+            # Create labels
             labels = input_ids.clone()
-            prompt_actual_length = prompt_tokens['input_ids'].shape[1]
-            labels[:prompt_actual_length] = -100  # Don't compute loss on prompt
+            # Mask prompt tokens (don't compute loss on them)
+            if prompt_length < len(labels):
+                labels[:prompt_length] = -100
+            
+            # Final validation of tensor shapes
+            assert input_ids.shape[0] == self.max_length, f"input_ids wrong shape: {input_ids.shape}"
+            assert attention_mask.shape[0] == self.max_length, f"attention_mask wrong shape: {attention_mask.shape}"  
+            assert labels.shape[0] == self.max_length, f"labels wrong shape: {labels.shape}"
             
             return {
                 'input_ids': input_ids,
