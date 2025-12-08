@@ -30,7 +30,7 @@ from tqdm import tqdm
 
 # Import our TitanLLaMA implementation
 from titan_llama import TitanLLaMAConfig, TitanLLaMAForCausalLM
-from train_datasets import SlimPajamaDataset, FineWebEduDataset
+from train_datasets import SlimPajamaDataset, FineWebEduDataset, BoolQDataset, WinograndeDataset, MixedEvalDataset
 from cuda_utils import log_cuda_mem
 from simple_eval import eval_winogrande_boolq, quick_eval_boolq, should_run_intermittent_eval, log_eval_metrics
 
@@ -423,16 +423,6 @@ def main():
             config=config.__dict__
         )
 
-    # Create model and optimizer
-    logger.info("Creating model and optimizer...")
-    model, optimizer, scheduler = create_model_and_optimizer(config, device)
-    
-    # Create tokenizer for evaluation
-    tokenizer = AutoTokenizer.from_pretrained(config.tokenizer_name)
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-    
-    
     # Create datasets
     logger.info("Creating datasets...")
 
@@ -476,6 +466,21 @@ def main():
             num_proc=config.num_proc,
         )
 
+    elif 'mixed' in config.dataset_name:
+        train_dataset = MixedEvalDataset(
+            tokenizer_name=config.tokenizer_name,
+            max_length=config.sequence_length,
+            boolq_split="train", 
+            winogrande_split="train",
+        )
+
+        eval_dataset = MixedEvalDataset(
+            tokenizer_name=config.tokenizer_name,
+            max_length=config.sequence_length,
+            boolq_split="validation" if "validation" in ["train"] else "train",  # Use train split for now 
+            winogrande_split="validation" if "validation" in ["train"] else "train",  # Use train split for now
+        )
+
     else: raise RuntimeError("Could not infer dataset")
 
     print("THIS IS THE MICRO BS FROM CFG: ", config.micro_batch_size)
@@ -496,6 +501,16 @@ def main():
         num_workers=2,
         pin_memory=True
     )
+
+    # Create model and optimizer
+    logger.info("Creating model and optimizer...")
+    model, optimizer, scheduler = create_model_and_optimizer(config, device)
+    
+    # Create tokenizer for evaluation
+    tokenizer = AutoTokenizer.from_pretrained(config.tokenizer_name)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    
     
     # Resume from checkpoint if specified
     start_step = 0
