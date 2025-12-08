@@ -211,6 +211,9 @@ class BoolQDataset(TorchDataset):
         # Precompute yes/no token IDs for consistent training
         self.yes_id = self.tokenizer.encode(" yes", add_special_tokens=False)[0]
         self.no_id = self.tokenizer.encode(" no", add_special_tokens=False)[0]
+        
+        # Store tokenizer name for multiprocessing
+        self.tokenizer_name_stored = tokenizer_name
     
     def __len__(self):
         return len(self.dataset)
@@ -311,6 +314,31 @@ class BoolQDataset(TorchDataset):
                     device="cpu",
                 ),
             }
+    
+    def __getstate__(self):
+        """Custom pickling for multiprocessing support."""
+        state = self.__dict__.copy()
+        # Remove the unpicklable tokenizer and dataset objects
+        state['tokenizer'] = None
+        state['dataset'] = None
+        return state
+    
+    def __setstate__(self, state):
+        """Custom unpickling for multiprocessing support."""
+        self.__dict__.update(state)
+        # Recreate tokenizer and dataset in worker process
+        self.tokenizer = AutoTokenizer.from_pretrained(self.tokenizer_name_stored)
+        if self.tokenizer.pad_token is None:
+            self.tokenizer.pad_token = self.tokenizer.eos_token
+        
+        # Recreate dataset (this might take some time in worker processes)
+        self.dataset = load_dataset("boolq", split=getattr(self, 'split', 'train'))
+        if hasattr(self, 'max_examples') and self.max_examples is not None:
+            self.dataset = self.dataset.select(range(min(self.max_examples, len(self.dataset))))
+        
+        # Recompute token IDs
+        self.yes_id = self.tokenizer.encode(" yes", add_special_tokens=False)[0]
+        self.no_id = self.tokenizer.encode(" no", add_special_tokens=False)[0]
 
 
 class WinograndeDataset(TorchDataset):
@@ -341,6 +369,12 @@ class WinograndeDataset(TorchDataset):
             self.dataset = self.dataset.select(range(min(max_examples, len(self.dataset))))
         
         print(f"Winogrande dataset loaded: {len(self.dataset)} examples")
+        
+        # Store parameters for multiprocessing
+        self.tokenizer_name_stored = tokenizer_name
+        self.winogrande_version_stored = winogrande_version
+        self.split_stored = split
+        self.max_examples_stored = max_examples
     
     def __len__(self):
         return len(self.dataset)
@@ -402,6 +436,27 @@ class WinograndeDataset(TorchDataset):
                 ),
                 'labels': dummy_ids.clone(),
             }
+    
+    def __getstate__(self):
+        """Custom pickling for multiprocessing support."""
+        state = self.__dict__.copy()
+        # Remove the unpicklable tokenizer and dataset objects
+        state['tokenizer'] = None
+        state['dataset'] = None
+        return state
+    
+    def __setstate__(self, state):
+        """Custom unpickling for multiprocessing support."""
+        self.__dict__.update(state)
+        # Recreate tokenizer and dataset in worker process
+        self.tokenizer = AutoTokenizer.from_pretrained(self.tokenizer_name_stored)
+        if self.tokenizer.pad_token is None:
+            self.tokenizer.pad_token = self.tokenizer.eos_token
+        
+        # Recreate dataset
+        self.dataset = load_dataset("winogrande", self.winogrande_version_stored, split=self.split_stored)
+        if self.max_examples_stored is not None:
+            self.dataset = self.dataset.select(range(min(self.max_examples_stored, len(self.dataset))))
 
 
 class MixedEvalDataset(TorchDataset):
