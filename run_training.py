@@ -68,6 +68,14 @@ def parse_args():
     # Resume training
     parser.add_argument("--resume_from_checkpoint", type=str, default=None, help="Resume from checkpoint")
     
+    # Attention Distillation
+    parser.add_argument("--use_attention_distillation", action="store_true", 
+                       help="Enable attention distillation loss")
+    parser.add_argument("--distillation_weight", type=float, default=0.1,
+                       help="Weight for distillation loss vs LM loss (default: 0.1)")
+    parser.add_argument("--distillation_layers", type=str, default="8,16,24",
+                       help="Comma-separated layer indices for distillation (default: 8,16,24)")
+    
     # Other options
     parser.add_argument("--no_wandb", action="store_true", help="Disable wandb logging")
     parser.add_argument("--debug", action="store_true", help="Enable debug mode")
@@ -80,6 +88,9 @@ def create_config_from_args(args):
     
     # Parse neural memory layers
     neural_memory_layers = tuple(map(int, args.neural_memory_layers.split(',')))
+    
+    # Parse distillation layers
+    distillation_layers = tuple(map(int, args.distillation_layers.split(',')))
     
     config = TrainingConfig(
         # Model config
@@ -130,6 +141,11 @@ def create_config_from_args(args):
         
         # Resume config
         resume_from_checkpoint=args.resume_from_checkpoint,
+        
+        # Attention Distillation config
+        use_attention_distillation=args.use_attention_distillation,
+        distillation_weight=args.distillation_weight,
+        distillation_layers=distillation_layers,
     )
     
     # Debug mode adjustments
@@ -172,15 +188,17 @@ def main_with_args():
     print(f"Total Tokens: {config.total_tokens:,}")
     print(f"Batch Size: {config.batch_size}")
     print(f"Sequence Length: {config.sequence_length}")
+    print(f"Attention Distillation: {config.use_attention_distillation}")
+    if config.use_attention_distillation:
+        print(f"  Weight: {config.distillation_weight}")
+        print(f"  Layers: {config.distillation_layers}")
     print(f"Learning Rate: {config.learning_rate}")
     print(f"Neural Memory LR: {config.neural_mem_learning_rate}")
     print(f"Output Directory: {config.output_dir}")
     print("="*80 + "\n")
     
-    # Set up the config globally and run training
-    import train_titan_llama
-    train_titan_llama.TrainingConfig = lambda: config
-    main()
+    # Run training with the config
+    main(config)
 
 
 if __name__ == "__main__":
