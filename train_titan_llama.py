@@ -2,6 +2,18 @@
 """
 Training script for TitanLLaMA on SlimPajama dataset.
 Trains on 1B tokens with segmented attention and neural memory.
+
+Attention Distillation Usage:
+    # Enable attention distillation with default settings
+    python train_titan_llama.py --use-attention-distillation
+    
+    # Custom distillation weight and layers
+    python train_titan_llama.py --use-attention-distillation \
+                                --distillation-weight 0.05 \
+                                --distillation-layers 4 8 12 16 20
+    
+The attention distillation loss compares segmented attention outputs with and without 
+flex attention optimizations, helping to maintain attention pattern fidelity.
 """
 
 import os
@@ -9,6 +21,7 @@ import json
 import math
 import time
 import logging
+import argparse
 from dataclasses import dataclass
 from typing import Optional, Dict, Any
 import random
@@ -33,6 +46,83 @@ from titan_llama import TitanLLaMAConfig, TitanLLaMAForCausalLM
 from train_datasets import SlimPajamaDataset, FineWebEduDataset, BoolQDataset, WinograndeDataset, MixedEvalDataset
 from cuda_utils import log_cuda_mem
 from simple_eval import eval_winogrande_boolq, quick_eval_boolq, should_run_intermittent_eval, log_eval_metrics
+
+
+def compute_attention_distillation_loss(model, input_ids, attention_mask, distillation_layers, device):
+    """
+    Compute attention distillation loss by comparing segmented attention outputs
+    with and without flex attention optimizations or neural memory features.
+    """
+    total_distill_loss = 0.0
+    num_layers = len(distillation_layers)
+    
+    if num_layers == 0:
+        return torch.tensor(0.0, device=device)
+    
+    # Get the base model (unwrap from DDP if needed)
+    base_model = model.module if hasattr(model, 'module') else model
+    if not hasattr(base_model, 'model'):
+        return torch.tensor(0.0, device=device)
+    
+    transformer_layers = base_model.model.layers
+    
+    # Run a forward pass to get intermediate hidden states
+    with torch.no_grad():
+        # Get embeddings
+        inputs_embeds = base_model.model.embed_tokens(input_ids)
+        hidden_states = inputs_embeds
+        
+        # Store hidden states for distillation layers
+        layer_hidden_states = {}
+        
+        for layer_idx, layer in enumerate(transformer_layers):
+            if layer_idx in distillation_layers:
+                layer_hidden_states[layer_idx] = hidden_states.clone()
+            
+            # Forward through layer
+            layer_outputs = layer(
+                hidden_states,
+                attention_mask=attention_mask,
+                use_cache=False,
+                output_attentions=False,
+            )
+            hidden_states = layer_outputs[0]
+    
+    # Now compute distillation loss for each specified layer
+    for layer_idx in distillation_layers:
+        if layer_idx >= len(transformer_layers) or layer_idx not in layer_hidden_states:
+            continue
+            
+        layer = transformer_layers[layer_idx]
+        layer_input = layer_hidden_states[layer_idx]
+        
+        # Get the segmented attention module
+        if hasattr(layer, 'self_attn') and hasattr(layer.self_attn, 'segmented_attn'):
+            attn_module = layer.self_attn.segmented_attn
+            
+            # Normalize input (as done in the layer)
+            normalized_input = layer.input_layernorm(layer_input)
+            
+            # Target: attention without flex attention (more basic implementation)
+            with torch.no_grad():
+                attn_target, _ = attn_module(
+                    normalized_input,
+                    disable_flex_attn=True,
+                    value_residual=None
+                )
+            
+            # Student: attention with flex attention enabled
+            attn_output, _ = attn_module(
+                normalized_input, 
+                disable_flex_attn=False,
+                value_residual=None
+            )
+            
+            # Compute MSE loss between outputs
+            layer_distill_loss = F.mse_loss(attn_output, attn_target.detach())
+            total_distill_loss += layer_distill_loss
+    
+    return total_distill_loss / max(num_layers, 1)
 
 
 @dataclass
@@ -79,6 +169,11 @@ class TrainingConfig:
     neural_mem_learning_rate: float = 1e-2  # Higher LR for neural memory
     neural_mem_momentum: float = 0.9
     neural_mem_weight_decay: float = 0.01
+    
+    # Attention distillation
+    use_attention_distillation: bool = False
+    distillation_weight: float = 0.1  # Weight for distillation loss vs LM loss
+    distillation_layers: tuple = (8, 16, 24)  # Which layers to apply distillation to
     
     # Optimization
     warmup_steps: int = 2000
@@ -419,8 +514,23 @@ def evaluate_model(model, eval_dataloader, device, max_eval_steps=100):
 def main():
     """Main training function."""
     
-    # Parse config (in real script, you'd use argparse or hydra)
-    config = TrainingConfig()
+    # Parse command line arguments
+    parser = argparse.ArgumentParser(description="Train TitanLLaMA with optional attention distillation")
+    parser.add_argument("--use-attention-distillation", action="store_true", 
+                       help="Enable attention distillation loss")
+    parser.add_argument("--distillation-weight", type=float, default=0.1,
+                       help="Weight for distillation loss vs LM loss (default: 0.1)")
+    parser.add_argument("--distillation-layers", nargs="+", type=int, default=[8, 16, 24],
+                       help="Which layers to apply distillation to (default: 8 16 24)")
+    
+    args = parser.parse_args()
+    
+    # Create config with command-line overrides
+    config = TrainingConfig(
+        use_attention_distillation=args.use_attention_distillation,
+        distillation_weight=args.distillation_weight,
+        distillation_layers=tuple(args.distillation_layers)
+    )
     
     # Set up logging
     logger = setup_logging(config)
@@ -428,6 +538,15 @@ def main():
         f"Backbone: {config.base_model_name} | use_pretrained={config.use_pretrained_backbone} | "
         f"freeze_backbone={config.freeze_backbone}"
     )
+    
+    # Log attention distillation settings
+    if config.use_attention_distillation:
+        logger.info(
+            f"Attention Distillation ENABLED | Weight: {config.distillation_weight} | "
+            f"Layers: {config.distillation_layers}"
+        )
+    else:
+        logger.info("Attention Distillation DISABLED")
     
     # Set up distributed training
     is_main_process = setup_distributed(config)
@@ -507,6 +626,21 @@ def main():
             winogrande_split="validation" if "validation" in ["train"] else "train",  # Use train split for now
         )
 
+    elif 'mixed' in config.dataset_name:
+        train_dataset = MixedEvalDataset(
+            tokenizer_name=config.tokenizer_name,
+            max_length=config.sequence_length,
+            boolq_split="train", 
+            winogrande_split="train",
+        )
+
+        eval_dataset = MixedEvalDataset(
+            tokenizer_name=config.tokenizer_name,
+            max_length=config.sequence_length,
+            boolq_split="validation" if "validation" in ["train"] else "train",  # Use train split for now 
+            winogrande_split="validation" if "validation" in ["train"] else "train",  # Use train split for now
+        )
+
     else: raise RuntimeError("Could not infer dataset")
 
     print("THIS IS THE MICRO BS FROM CFG: ", config.micro_batch_size)
@@ -527,20 +661,6 @@ def main():
         num_workers=0,  # Set to 0 to avoid multiprocessing issues with HF datasets
         pin_memory=True
     )
-
-    # Create model and optimizer
-    logger.info("Creating model and optimizer...")
-    model, optimizer, scheduler = create_model_and_optimizer(config, device)
-    
-    # Create tokenizer for evaluation
-    tokenizer = AutoTokenizer.from_pretrained(config.tokenizer_name)
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-
-    if config.pretrained_from_checkpoint and not config.resume_from_checkpoint:
-        # If DDP is enabled, load into the underlying module
-        model_to_load = model.module if isinstance(model, DDP) else model
-        load_pretrained_from_checkpoint(model_to_load, config.pretrained_from_checkpoint)
     
     # Resume from checkpoint if specified
     start_step = 0
@@ -555,6 +675,8 @@ def main():
     
     model.train()
     running_loss = 0.0
+    running_lm_loss = 0.0
+    running_distill_loss = 0.0
     running_accuracy = 0.0
     running_ppl = 0.0
     log_steps = 0
@@ -570,6 +692,8 @@ def main():
         #     log_cuda_mem("before forward")
 
         epoch_loss = 0.0
+        epoch_lm_loss = 0.0
+        epoch_distill_loss = 0.0
         epoch_accuracy = 0.0
         epoch_ppl = 0.0
         
@@ -586,12 +710,25 @@ def main():
             if len(input_ids.shape) == 1: input_ids = input_ids.unsqueeze(0)
             labels = batch['labels'].to(device) 
             if len(labels.shape) == 1: labels = labels.unsqueeze(0)
+            attention_mask = batch.get('attention_mask', torch.ones_like(input_ids)).to(device)
 
             # print("TRAIN SIZE: ", input_ids.shape)
             
             # Forward pass
             outputs = model(input_ids=input_ids, labels=labels)
-            loss = outputs['loss'] / config.gradient_accumulation_steps
+            lm_loss = outputs['loss'] / config.gradient_accumulation_steps
+            
+            # Compute attention distillation loss if enabled
+            distill_loss = torch.tensor(0.0, device=device)
+            if config.use_attention_distillation:
+                distill_loss = compute_attention_distillation_loss(
+                    model, input_ids, attention_mask, config.distillation_layers, device
+                )
+                distill_loss = distill_loss / config.gradient_accumulation_steps
+            
+            # Combine losses
+            total_loss = lm_loss + config.distillation_weight * distill_loss
+            loss = total_loss
 
             # if step == 0:
             #     log_cuda_mem("after forward")
@@ -599,6 +736,8 @@ def main():
             # Backward pass
             loss.backward()
             epoch_loss += loss.item()
+            epoch_lm_loss += lm_loss.item()
+            epoch_distill_loss += distill_loss.item()
             epoch_ppl += outputs['ppl'].item()
             epoch_accuracy += outputs['correct'].item()
 
@@ -624,35 +763,52 @@ def main():
         
         # Logging
         running_loss += epoch_loss
+        running_lm_loss += epoch_lm_loss
+        running_distill_loss += epoch_distill_loss
         running_accuracy += epoch_accuracy
         running_ppl += epoch_ppl
         log_steps += 1
         
         if step % config.log_interval == 0 and is_main_process:
             avg_loss = running_loss / log_steps
+            avg_lm_loss = running_lm_loss / log_steps
+            avg_distill_loss = running_distill_loss / log_steps
             avg_acc = running_accuracy / log_steps
             avg_ppl = running_ppl / log_steps
             lr = scheduler.get_last_lr()[0]
             
-            logger.info(
+            log_msg = (
                 f"Step {step}/{config.total_steps} | "
                 f"Loss: {avg_loss:.4f} | "
-                f"LR: {lr:.2e} | "
-                f"Tokens: {step * config.tokens_per_batch:,}"
+                f"LM: {avg_lm_loss:.4f}"
             )
+            
+            if config.use_attention_distillation:
+                log_msg += f" | Distill: {avg_distill_loss:.4f}"
+                
+            log_msg += f" | LR: {lr:.2e} | Tokens: {step * config.tokens_per_batch:,}"
+            logger.info(log_msg)
             
             # Log to wandb
             if wandb and wandb.run:
-                wandb.log({
+                log_dict = {
                     'train/loss': avg_loss,
+                    'train/lm_loss': avg_lm_loss,
                     'train/ppl': avg_ppl / config.gradient_accumulation_steps,
                     'train/accuracy': avg_acc / config.gradient_accumulation_steps,
                     'train/learning_rate': lr,
                     'train/step': step,
                     'train/tokens_processed': step * config.tokens_per_batch
-                })
+                }
+                
+                if config.use_attention_distillation:
+                    log_dict['train/distillation_loss'] = avg_distill_loss
+                    
+                wandb.log(log_dict)
             
             running_loss = 0.0
+            running_lm_loss = 0.0
+            running_distill_loss = 0.0
             running_accuracy = 0.0
             running_ppl = 0.0
             log_steps = 0
