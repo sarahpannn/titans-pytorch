@@ -6,7 +6,7 @@ All evaluations use the same core approach:
 - Consistent memory reset handling for Titan models
 - Unified interface via `MultipleChoiceEvaluator`
 
-Supported datasets: BoolQ, Winogrande, PubMedQA, MMLU, HellaSwag, ARC, PIQA
+Supported datasets: BoolQ, Winogrande, PubMedQA, MMLU, HellaSwag, ARC, PIQA, AQuA-RAT
 """
 
 import math
@@ -286,6 +286,23 @@ def load_piqa(max_examples: Optional[int] = None, split: str = "validation") -> 
     ]
 
 
+def load_aqua_rat(max_examples: Optional[int] = None, split: str = "validation") -> List[Dict]:
+    """Load AQuA-RAT dataset (algebraic reasoning with rationales)."""
+    ds = load_dataset("deepmind/aqua_rat", split=split)
+    if max_examples is not None:
+        ds = ds.select(range(min(max_examples, len(ds))))
+    
+    return [
+        {
+            "question": ex["question"],
+            "choices": ex["options"],  # List of 5 options (A-E)
+            "answer": ord(ex["correct"]) - ord("A"),  # Convert "A"-"E" to 0-4
+            "rationale": ex.get("rationale", ""),
+        }
+        for ex in ds
+    ]
+
+
 def load_casehold(max_examples: Optional[int] = None, split: str = "validation") -> List[Dict]:
     """Load LexGLUE CaseHOLD dataset."""
     ds = load_dataset("coastalcph/lex_glue", "case_hold", split=split)
@@ -410,6 +427,7 @@ EVAL_BATCH_SIZE_DEFAULTS = {
     "arc_easy": 8,
     "arc_challenge": 8,
     "piqa": 8,
+    "aqua_rat": 4,       # Math reasoning
     "casehold": 2,       # Long legal contexts
     "commonsenseqa": 8,
     "drop": 2,           # Generative, long contexts
@@ -557,6 +575,19 @@ class MultipleChoiceEvaluator:
         candidates = [f"Goal: {goal}\nSolution: {choice}" for choice in ex["choices"]]
         return candidates, ex["answer"]
     
+    def _format_aqua_rat(self, ex: Dict) -> Tuple[List[str], int]:
+        """Format AQuA-RAT example into candidate sequences."""
+        question = ex["question"]
+        choices = ex["choices"]
+        
+        prompt = f"Question: {question}\n"
+        candidates = []
+        for i, choice in enumerate(choices):
+            letter = chr(ord('A') + i)
+            candidates.append(f"{prompt}Answer: {letter}. {choice}")
+        
+        return candidates, ex["answer"]
+    
     def _format_casehold(self, ex: Dict) -> Tuple[List[str], int]:
         """Format CaseHOLD example into candidate sequences."""
         context = ex["context"]
@@ -668,6 +699,7 @@ class MultipleChoiceEvaluator:
                 "arc_easy": lambda **kw: load_arc(challenge=False, **kw),
                 "arc_challenge": lambda **kw: load_arc(challenge=True, **kw),
                 "piqa": load_piqa,
+                "aqua_rat": load_aqua_rat,
                 "casehold": load_casehold,
                 "commonsenseqa": load_commonsenseqa,
             }
@@ -688,6 +720,7 @@ class MultipleChoiceEvaluator:
             "arc_easy": self._format_arc,
             "arc_challenge": self._format_arc,
             "piqa": self._format_piqa,
+            "aqua_rat": self._format_aqua_rat,
             "casehold": self._format_casehold,
             "commonsenseqa": self._format_commonsenseqa,
         }
@@ -1160,6 +1193,31 @@ def eval_piqa(
     return {"piqa_acc": result.accuracy}
 
 
+def eval_aqua_rat(
+    model: PreTrainedModel,
+    tokenizer: PreTrainedTokenizerBase,
+    device: Union[torch.device, str] = "cuda",
+    batch_size: int = 4,
+    max_input_len: int = 512,
+    max_examples: Optional[int] = None,
+    split: str = "validation",
+) -> Dict[str, float]:
+    """
+    Evaluate AQuA-RAT (algebraic reasoning with rationales).
+    Returns {"aqua_rat_acc": float}.
+    """
+    data = load_aqua_rat(max_examples=max_examples, split=split)
+    evaluator_obj = MultipleChoiceEvaluator(
+        model=model,
+        tokenizer=tokenizer,
+        device=device,
+        batch_size=batch_size,
+        max_length=max_input_len,
+    )
+    result = evaluator_obj.evaluate("aqua_rat", data=data)
+    return {"aqua_rat_acc": result.accuracy}
+
+
 def eval_casehold(
     model: PreTrainedModel,
     tokenizer: PreTrainedTokenizerBase,
@@ -1378,7 +1436,7 @@ def eval_all_benchmarks(
     """
     # Multiple-choice datasets
     mc_datasets = ["boolq", "winogrande", "pubmedqa", "mmlu", "hellaswag", 
-                   "arc", "piqa", "casehold", "commonsenseqa"]
+                   "arc", "piqa", "aqua_rat", "casehold", "commonsenseqa"]
     # Generative datasets
     gen_datasets = ["drop", "squadv2"]
     

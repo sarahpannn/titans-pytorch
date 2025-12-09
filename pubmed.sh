@@ -17,12 +17,11 @@ python3 run_training.py \
     --learning_rate 3e-4 \
     --neural_mem_lr 1e-3 \
     --log_interval 1 \
-    --intermittent_eval_frequency 10 \
+    --intermittent_eval_frequency 30 \
     --intermittent_eval_limit 256 \
     --intermittent_eval_start_step 0 \
     --use_attention_distillation \
     --distillation_weight 0.85 \
     --distillation_layers "4,8,12,16,20" \
     --neural_memory_layers "4,8,12,16,20" \
-    --save_interval 40 \
-    --no_wandb
+    --save_interval 40

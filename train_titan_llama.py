@@ -908,6 +908,11 @@ def main(config=None):
                     max_examples=config.intermittent_eval_limit,
                     boolq_batch_size=config.micro_batch_size,
                 )
+                logger.info(
+                f"[eval] step {step} "
+                f"BoolQ acc={eval_metrics['boolq_acc']:.3f}, "
+                f"Winogrande acc={eval_metrics['winogrande_acc']:.3f}"
+            )
             elif 'pubmed' in config.dataset_name:
                 eval_metrics = eval_pubmedqa(
                     model=model,
@@ -917,15 +922,15 @@ def main(config=None):
                     batch_size=config.micro_batch_size,
                     max_input_len=config.sequence_length,
                 )
+                logger.info(
+                f"[eval] step {step} "
+                f"pubmedqa acc={eval_metrics['pubmedqa_acc']:.3f}, "
+                )
             else:
                 logger.warning(f"Intermittent evaluation not implemented for dataset {config.train_dataset}")
                 eval_metrics = {}
 
-            logger.info(
-                f"[eval] step {step} "
-                f"BoolQ acc={eval_metrics['boolq_acc']:.3f}, "
-                f"Winogrande acc={eval_metrics['winogrande_acc']:.3f}"
-            )
+            
             log_eval_metrics(eval_metrics, step, logger, wandb)
 
             # Complete cleanup and state restoration

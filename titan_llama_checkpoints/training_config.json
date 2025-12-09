@@ -63,7 +63,7 @@
   "world_size": 1,
   "output_dir": "./titan_llama_checkpoints",
   "wandb_project": "titan-llama-training",
-  "wandb_run_name": "titan-llama-1b-1765296158",
+  "wandb_run_name": "titan-llama-1b-1765297574",
   "log_level": "INFO",
   "resume_from_checkpoint": null,
   "pretrained_from_checkpoint": null,
