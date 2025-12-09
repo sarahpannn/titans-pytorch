@@ -1,0 +1,13 @@
+python -u train_domain_memory.py \
+  --domain pubmedqa \
+  --base_model_name "meta-llama/Meta-Llama-3.1-8B" \
+  --base_checkpoint titan_llama_checkpoints/titan_llama_lm_attn_dst.pt \
+  --output_dir runs/pubmedqa-nmm-attn-dst \
+  --max_length 512 \
+  --batch_size 8 \
+  --eval_batch_size 8 \
+  --num_epochs 1 \
+  --steps_per_epoch 10 \
+  --eval_every 0 \
+  --learning_rate 3e-4 \
+  --neural_mem_lr 1e-5
