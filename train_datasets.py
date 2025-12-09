@@ -334,29 +334,10 @@ class WinograndeDataset(TorchDataset):
             padding="max_length",
             truncation=True,
             return_tensors="pt",
-            add_special_tokens=True,
         )
 
-        input_ids = tokens["input_ids"].squeeze(0)
-        attention_mask = tokens["attention_mask"].squeeze(0)
-
-        if input_ids.shape[0] != self.max_length:
-            if input_ids.shape[0] < self.max_length:
-                pad_len = self.max_length - input_ids.shape[0]
-                pad_ids = torch.full(
-                    (pad_len,),
-                    self.tokenizer.pad_token_id,
-                    dtype=input_ids.dtype,
-                )
-                pad_mask = torch.zeros(
-                    pad_len,
-                    dtype=attention_mask.dtype,
-                )
-                input_ids = torch.cat([input_ids, pad_ids], dim=0)
-                attention_mask = torch.cat([attention_mask, pad_mask], dim=0)
-            else:
-                input_ids = input_ids[: self.max_length]
-                attention_mask = attention_mask[: self.max_length]
+        input_ids = tokens["input_ids"].squeeze(0).to("cpu", non_blocking=False)
+        attention_mask = tokens["attention_mask"].squeeze(0).to("cpu", non_blocking=False)
 
         prompt_only_tokens = self.tokenizer(
             prompt,
@@ -367,8 +348,8 @@ class WinograndeDataset(TorchDataset):
         prompt_length = prompt_only_tokens["input_ids"].shape[1]
 
         labels = input_ids.clone()
-        if prompt_length < labels.shape[0]:
-            labels[:prompt_length] = -100
+        # if prompt_length < labels.shape[0]:
+        #     labels[:prompt_length] = -100
 
         assert input_ids.device.type == "cpu"
         assert attention_mask.device.type == "cpu"
@@ -441,3 +422,227 @@ class MixedEvalDataset(TorchDataset):
         else:
             win_idx = (idx - self.boolq_samples) % len(self.winogrande_dataset)
             return self.winogrande_dataset[win_idx]
+
+class PubMedQADataset(TorchDataset):
+    """
+    Dataset class for PubMedQA tokenized data, BoolQ-style outputs.
+
+    Uses the qiaojin/PubMedQA dataset on HuggingFace. By default we use the
+    labeled split (`pqa_labeled`), which has yes/no/maybe `final_decision`
+    labels.
+
+    Each example is formatted roughly as:
+
+        Question: ...
+        Context: ...
+        Long answer: ...
+        Final decision (yes / no / maybe): ...
+
+    and we train with full LM loss over the entire sequence
+    (labels = input_ids.clone()).
+    """
+
+    def __init__(
+        self,
+        config_name: str = "pqa_artificial",
+        tokenizer_name: str = "meta-llama/Meta-Llama-3.1-8B",
+        max_length: int = 2048,
+        split: str = "train",
+        num_proc: int = 8,          # kept for API compatibility
+        max_examples: int | None = None,
+    ):
+        self.max_length = max_length
+        self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
+
+        if self.tokenizer.pad_token is None:
+            self.tokenizer.pad_token = self.tokenizer.eos_token
+
+        # PubMedQA as hosted under qiaojin/PubMedQA uses only a train split
+        # for the main configs; in practice you probably want split="train".
+        print(f"Loading PubMedQA dataset (config: {config_name}, split: {split})...")
+        self.dataset = load_dataset("qiaojin/PubMedQA", config_name, split=split)
+
+        if max_examples is not None:
+            self.dataset = self.dataset.select(
+                range(min(max_examples, len(self.dataset)))
+            )
+
+        print(f"PubMedQA dataset loaded: {len(self.dataset)} examples")
+
+    def __len__(self):
+        return len(self.dataset)
+
+    def __getitem__(self, idx):
+        item = self.dataset[idx]
+
+        question = item.get("question", "")
+
+        # In the HF script, `context` is a structured field with "contexts"
+        # as a sequence of strings. We join them into one big context.
+        context = item.get("context", {})
+        contexts = context.get("contexts", "") if isinstance(context, dict) else context
+        if isinstance(contexts, (list, tuple)):
+            context_text = " ".join(contexts)
+        else:
+            context_text = str(contexts)
+
+        long_answer = item.get("long_answer", "")
+        final_decision = item.get("final_decision", "")
+
+        parts = [
+            f"Question: {question}",
+            f"Context: {context_text}",
+        ]
+        if long_answer:
+            parts.append(f"Long answer: {long_answer}")
+        if final_decision:
+            parts.append(
+                f"Final decision (yes / no / maybe): {final_decision}"
+            )
+
+        text = "\n".join(parts)
+
+        tokens = self.tokenizer(
+            text,
+            max_length=self.max_length,
+            padding="max_length",
+            truncation=True,
+            return_tensors="pt",
+        )
+
+        # Force everything to CPU, consistent with BoolQ/Winogrande/etc.
+        input_ids = tokens["input_ids"].squeeze(0).to("cpu", non_blocking=False)
+        attention_mask = tokens["attention_mask"].squeeze(0).to("cpu", non_blocking=False)
+
+        labels = input_ids.clone()  # full LM loss
+
+        assert input_ids.device.type == "cpu"
+        assert attention_mask.device.type == "cpu"
+        assert labels.device.type == "cpu"
+        assert input_ids.shape[0] == self.max_length
+        assert attention_mask.shape[0] == self.max_length
+        assert labels.shape[0] == self.max_length
+
+        return {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "labels": labels,
+        }
+
+class CaseHoldDataset(TorchDataset):
+    """
+    LexGLUE CaseHOLD subset as multiple-choice prompt + single-token answer.
+    Follows the Winogrande style: we list the options in the prompt and only
+    put loss on the final answer letter (A–E).
+    """
+
+    def __init__(
+        self,
+        tokenizer_name: str = "meta-llama/Meta-Llama-3.1-8B",
+        max_length: int = 512,
+        split: str = "train",            # "train", "validation", or "test"
+        num_proc: int = 8,               # kept for API compatibility, not used
+        max_examples: int | None = None,
+    ):
+        self.max_length = max_length
+        self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
+
+        if self.tokenizer.pad_token is None:
+            self.tokenizer.pad_token = self.tokenizer.eos_token
+
+        print(f"Loading LexGLUE CaseHOLD dataset (split: {split})...")
+        self.dataset = load_dataset(
+            "coastalcph/lex_glue",
+            "case_hold",
+            split=split,
+        )
+
+        if max_examples is not None:
+            self.dataset = self.dataset.select(
+                range(min(max_examples, len(self.dataset)))
+            )
+
+        print(f"CaseHOLD dataset loaded: {len(self.dataset)} examples")
+
+        # Option letters we’ll use in the prompt and answer
+        self.option_letters = ["A", "B", "C", "D", "E"]
+
+    def __len__(self):
+        return len(self.dataset)
+
+    def __getitem__(self, idx):
+        item = self.dataset[idx]
+
+        context = item["context"]
+
+        # HF viewer shows both "endings" and "sequence"; the actual list-of-options
+        # is in "sequence" on the parquet version. Fall back to "endings" just in case.
+        options = item.get("sequence", None)
+        if options is None:
+            options = item.get("endings", None)
+        if options is None:
+            raise KeyError("Expected 'sequence' or 'endings' field in CaseHOLD example.")
+
+        assert len(options) == 5, f"Expected 5 options, got {len(options)}."
+
+        label_idx = int(item["label"])
+        assert 0 <= label_idx < len(options), f"Bad label index {label_idx}."
+
+        # Build prompt listing all options.
+        # This mirrors your Winogrande style: prompt then a short answer token.
+        lines = [f"Context: {context}"]
+        for i, opt in enumerate(options):
+            letter = self.option_letters[i]
+            lines.append(f"Option {letter}: {opt}")
+        prompt = "\n".join(lines) + "\nAnswer (A, B, C, D, or E):"
+
+        # Target answer is just the letter, prefixed with a space to be similar
+        # to Winogrande’s " 1"/" 2" formatting.
+        target_answer = " " + self.option_letters[label_idx]
+        full_text = prompt + target_answer
+
+        tokens = self.tokenizer(
+            full_text,
+            max_length=self.max_length,
+            truncation=True,
+            padding="max_length",
+            add_special_tokens=True,
+            return_tensors="pt",
+        )
+
+        input_ids = tokens["input_ids"].squeeze(0)
+        attention_mask = tokens["attention_mask"].squeeze(0)
+
+        # Get the length of just the prompt (no answer attached),
+        # so we can mask its labels to -100 and only train on the answer.
+        prompt_only_tokens = self.tokenizer(
+            prompt,
+            max_length=self.max_length,
+            truncation=True,
+            add_special_tokens=True,
+            return_tensors="pt",
+        )
+        prompt_length = prompt_only_tokens["input_ids"].shape[1]
+
+        labels = input_ids.clone()
+        if prompt_length < labels.shape[0]:
+            labels[:prompt_length] = -100
+
+        # Force everything to CPU, consistent with your other datasets
+        input_ids = input_ids.to("cpu", non_blocking=False)
+        attention_mask = attention_mask.to("cpu", non_blocking=False)
+        labels = labels.to("cpu", non_blocking=False)
+
+        assert input_ids.device.type == "cpu"
+        assert attention_mask.device.type == "cpu"
+        assert labels.device.type == "cpu"
+
+        assert input_ids.shape[0] == self.max_length
+        assert attention_mask.shape[0] == self.max_length
+        assert labels.shape[0] == self.max_length
+
+        return {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "labels": labels,
+        }

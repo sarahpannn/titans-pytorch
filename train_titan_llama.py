@@ -43,9 +43,9 @@ from tqdm import tqdm
 
 # Import our TitanLLaMA implementation
 from titan_llama import TitanLLaMAConfig, TitanLLaMAForCausalLM
-from train_datasets import SlimPajamaDataset, FineWebEduDataset, BoolQDataset, WinograndeDataset, MixedEvalDataset
+from train_datasets import SlimPajamaDataset, FineWebEduDataset, BoolQDataset, WinograndeDataset, MixedEvalDataset, PubMedQADataset
 from cuda_utils import log_cuda_mem
-from simple_eval import eval_winogrande_boolq, quick_eval_boolq, should_run_intermittent_eval, log_eval_metrics
+from simple_eval import eval_winogrande_boolq, quick_eval_boolq, should_run_intermittent_eval, log_eval_metrics, eval_pubmedqa
 
 
 def compute_attention_distillation_loss(
@@ -164,12 +164,13 @@ class TrainingConfig:
     
     # Training configuration
     total_tokens: int = 1_000_000_000  # 1B tokens
+    num_epochs: int = 1
     batch_size: int = 4
     micro_batch_size: int = 1
     sequence_length: int = 2048
     gradient_accumulation_steps: int = 4
     learning_rate: float = 3e-4
-    min_learning_rate: float = 3e-5
+    min_learning_rate: float = 0.001 * learning_rate
     weight_decay: float = 0.1
     beta1: float = 0.9
     beta2: float = 0.95
@@ -250,7 +251,7 @@ def setup_distributed(config: TrainingConfig):
         if 'RANK' in os.environ and 'WORLD_SIZE' in os.environ:
             config.local_rank = int(os.environ['RANK'])
             config.world_size = int(os.environ['WORLD_SIZE'])
-        
+            
         torch.cuda.set_device(config.local_rank)
         dist.init_process_group(backend='nccl')
     
@@ -622,6 +623,19 @@ def main(config=None):
             num_proc=config.num_proc,
         )
 
+    elif 'winogrande' in config.dataset_name:
+        train_dataset = WinograndeDataset(
+            tokenizer_name=config.tokenizer_name,
+            max_length=config.sequence_length,
+            split="train",
+        )
+
+        eval_dataset = WinograndeDataset(
+            tokenizer_name=config.tokenizer_name,
+            max_length=config.sequence_length,
+            split="validation" if "validation" in ["train"] else "train",  # Use train split for now
+        )
+
     elif 'mixed' in config.dataset_name:
         train_dataset = MixedEvalDataset(
             tokenizer_name=config.tokenizer_name,
@@ -637,8 +651,34 @@ def main(config=None):
             winogrande_split="validation" if "validation" in ["train"] else "train",  # Use train split for now
         )
 
+    elif 'pubmed' in config.dataset_name:
+        train_dataset = PubMedQADataset(
+            tokenizer_name=config.tokenizer_name,
+            max_length=config.sequence_length,
+            split="train",
+        )
+
+        eval_dataset = PubMedQADataset(
+            config_name='pqa_labeled', # this is the eval subset
+            max_length=config.sequence_length,
+            split="train",
+        )
+
     else: raise RuntimeError("Could not infer dataset")
 
+    finetune_keywords = ("winogrande", "mixed", "pubmed", "boolq")
+    if any(k in config.dataset_name.lower() for k in finetune_keywords):
+        # steps per epoch = ceil(len(dataset) / (micro_batch_size * grad_acc_steps))
+        steps_per_epoch = math.ceil(
+            len(train_dataset) / (config.micro_batch_size * config.gradient_accumulation_steps)
+        )
+        config.total_steps = steps_per_epoch * config.num_epochs
+
+        logger.info(
+            f"Using epoch-based training for '{config.dataset_name}': "
+            f"{config.num_epochs} epochs x {steps_per_epoch} steps/epoch "
+            f"= {config.total_steps} total steps"
+        )
     print("THIS IS THE MICRO BS FROM CFG: ", config.micro_batch_size)
     
     # Create data loaders
@@ -647,7 +687,8 @@ def main(config=None):
         batch_size=config.micro_batch_size,
         shuffle=False,  # Streaming dataset
         num_workers=0,  # Set to 0 to avoid multiprocessing issues with HF datasets
-        pin_memory=True
+        pin_memory=True,
+        drop_last=True,
     )
     
     eval_dataloader = DataLoader(
@@ -655,7 +696,8 @@ def main(config=None):
         batch_size=config.micro_batch_size,
         shuffle=False,
         num_workers=0,  # Set to 0 to avoid multiprocessing issues with HF datasets
-        pin_memory=True
+        pin_memory=True,
+        drop_last=True,
     )
 
     model, optimizer, scheduler = create_model_and_optimizer(config, device)
@@ -858,14 +900,26 @@ def main(config=None):
                     model.module.reset_memory_states()
             except Exception as e:
                 logger.warning(f"Failed to reset memory states before eval: {str(e)}")
-
-            eval_metrics = eval_winogrande_boolq(
-                model=model,
-                tokenizer=tokenizer,
-                device=device,
-                max_examples=config.intermittent_eval_limit,
-                boolq_batch_size=config.micro_batch_size,
-            )
+            if config.dataset_name in ['mixed', 'winogrande', 'boolq']:
+                eval_metrics = eval_mixed_boolq_winogrande(
+                    model=model,
+                    tokenizer=tokenizer,
+                    device=device,
+                    max_examples=config.intermittent_eval_limit,
+                    boolq_batch_size=config.micro_batch_size,
+                )
+            elif 'pubmed' in config.dataset_name:
+                eval_metrics = eval_pubmedqa(
+                    model=model,
+                    tokenizer=tokenizer,
+                    device=device,
+                    max_examples=config.intermittent_eval_limit,
+                    batch_size=config.micro_batch_size,
+                    max_input_len=config.sequence_length,
+                )
+            else:
+                logger.warning(f"Intermittent evaluation not implemented for dataset {config.train_dataset}")
+                eval_metrics = {}
 
             logger.info(
                 f"[eval] step {step} "

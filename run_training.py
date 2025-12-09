@@ -37,6 +37,7 @@ def parse_args():
     
     # Training configuration
     parser.add_argument("--total_tokens", type=int, default=1_000_000_000, help="Total tokens to train on")
+    parser.add_argument("--num-epochs", type=int, default=1, help="Number of epochs for finetuning datasets (winogrande/boolq/pubmed/mixed)")
     parser.add_argument("--batch_size", type=int, default=128, help="Batch size")
     parser.add_argument("--micro_batch_size", type=int, default=1, help="Micro batch size")
     parser.add_argument("--sequence_length", type=int, default=2048, help="Sequence length")
@@ -64,6 +65,7 @@ def parse_args():
     
     # Distributed training
     parser.add_argument("--use_ddp", action="store_true", help="Use distributed training")
+    parser.add_argument("--local_rank", type=int, default=0, help="Local rank for distributed training")
     
     # Resume training
     parser.add_argument("--resume_from_checkpoint", type=str, default=None, help="Resume from checkpoint")
