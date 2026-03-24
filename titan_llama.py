@@ -23,7 +23,7 @@ except ImportError:
 
 class TitanLLaMAConfig:
     """Configuration for Titan-LLaMA model with segmented attention and neural memory."""
-    
+
     def __init__(
         self,
         vocab_size: int = 32000,
@@ -52,6 +52,12 @@ class TitanLLaMAConfig:
         use_pretrained_backbone: bool = False,
         base_model_name_or_path: Optional[str] = None,
         freeze_backbone: bool = True,
+        # LoRA parameters for attention adaptation
+        use_lora: bool = False,
+        lora_rank: int = 8,
+        lora_alpha: int = 16,
+        lora_dropout: float = 0.0,
+        lora_layers_after_memory: int = 1,  # How many layers after each memory layer get LoRA
     ):
         self.vocab_size = vocab_size
         self.hidden_size = hidden_size
@@ -78,6 +84,24 @@ class TitanLLaMAConfig:
         self.use_pretrained_backbone = use_pretrained_backbone
         self.base_model_name_or_path = base_model_name_or_path
         self.freeze_backbone = freeze_backbone
+        # LoRA parameters
+        self.use_lora = use_lora
+        self.lora_rank = lora_rank
+        self.lora_alpha = lora_alpha
+        self.lora_dropout = lora_dropout
+        self.lora_layers_after_memory = lora_layers_after_memory
+
+    def get_lora_layer_indices(self) -> set:
+        """Return the set of layer indices that should have LoRA adapters."""
+        if not self.use_lora:
+            return set()
+        lora_layers = set()
+        for mem_layer in self.neural_memory_layers:
+            lora_layers.add(mem_layer)
+            for offset in range(1, self.lora_layers_after_memory + 1):
+                if mem_layer + offset < self.num_hidden_layers:
+                    lora_layers.add(mem_layer + offset)
+        return lora_layers
 
     @classmethod
     def from_llama_config(cls, llama_config, **overrides):
@@ -98,6 +122,11 @@ class TitanLLaMAConfig:
             'use_pretrained_backbone',
             'base_model_name_or_path',
             'freeze_backbone',
+            'use_lora',
+            'lora_rank',
+            'lora_alpha',
+            'lora_dropout',
+            'lora_layers_after_memory',
         }
 
         titan_kwargs = {k: v for k, v in overrides.items() if k in titan_specific_keys}
@@ -118,7 +147,7 @@ class TitanLLaMAConfig:
 
 class TitanLLaMARMSNorm(nn.Module):
     """RMSNorm implementation matching LLaMA."""
-    
+
     def __init__(self, hidden_size: int, eps: float = 1e-6):
         super().__init__()
         self.weight = nn.Parameter(torch.ones(hidden_size))
@@ -130,6 +159,72 @@ class TitanLLaMARMSNorm(nn.Module):
         variance = hidden_states.pow(2).mean(-1, keepdim=True)
         hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
         return self.weight * hidden_states.to(input_dtype)
+
+
+class LoRALayer(nn.Module):
+    """
+    Low-Rank Adaptation layer for adapting attention to neural memory distributions.
+
+    Computes: output = input + (dropout(input @ A) @ B) * scaling
+    where A is (in_features, rank) and B is (rank, out_features).
+    """
+
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        rank: int = 8,
+        alpha: int = 16,
+        dropout: float = 0.0,
+    ):
+        super().__init__()
+        self.rank = rank
+        self.alpha = alpha
+        self.scaling = alpha / rank
+        self.in_features = in_features
+        self.out_features = out_features
+
+        # LoRA matrices
+        self.lora_A = nn.Linear(in_features, rank, bias=False)
+        self.lora_B = nn.Linear(rank, out_features, bias=False)
+        self.dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
+
+        # Initialize A with Kaiming, B with zeros (so LoRA starts as identity)
+        nn.init.kaiming_uniform_(self.lora_A.weight, a=math.sqrt(5))
+        nn.init.zeros_(self.lora_B.weight)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply LoRA: returns the delta to add to the original output."""
+        return self.lora_B(self.dropout(self.lora_A(x))) * self.scaling
+
+
+class LoRALinear(nn.Module):
+    """
+    A linear layer with an attached LoRA adapter.
+
+    This wraps an existing linear layer and adds a low-rank update.
+    output = base_linear(x) + lora(x)
+    """
+
+    def __init__(
+        self,
+        base_linear: nn.Linear,
+        rank: int = 8,
+        alpha: int = 16,
+        dropout: float = 0.0,
+    ):
+        super().__init__()
+        self.base_linear = base_linear
+        self.lora = LoRALayer(
+            in_features=base_linear.in_features,
+            out_features=base_linear.out_features,
+            rank=rank,
+            alpha=alpha,
+            dropout=dropout,
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.base_linear(x) + self.lora(x)
 
 
 class TitanLLaMAMLP(nn.Module):
@@ -154,8 +249,11 @@ class TitanLLaMAAttention(nn.Module):
     """
     Titan-LLaMA Attention layer that integrates segmented attention with LLaMA's architecture.
     Uses the segmented attention mechanism from titans-pytorch for improved memory efficiency.
+
+    Optionally includes LoRA adapters on QKV and output projections to help attention
+    adapt to the modified hidden state distribution from neural memory.
     """
-    
+
     def __init__(self, config: TitanLLaMAConfig, layer_idx: int):
         super().__init__()
         self.config = config
@@ -187,6 +285,25 @@ class TitanLLaMAAttention(nn.Module):
             use_flex_attn=config.use_flex_attn
         )
 
+        # Check if this layer should have LoRA adapters
+        self.has_lora = config.use_lora and layer_idx in config.get_lora_layer_indices()
+
+        if self.has_lora:
+            # Wrap the internal projections with LoRA
+            # This directly adapts Q, K, V, and O projections
+            self.segmented_attn.to_qkv = LoRALinear(
+                base_linear=self.segmented_attn.to_qkv,
+                rank=config.lora_rank,
+                alpha=config.lora_alpha,
+                dropout=config.lora_dropout,
+            )
+            self.segmented_attn.to_out = LoRALinear(
+                base_linear=self.segmented_attn.to_out,
+                rank=config.lora_rank,
+                alpha=config.lora_alpha,
+                dropout=config.lora_dropout,
+            )
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -199,19 +316,17 @@ class TitanLLaMAAttention(nn.Module):
         value_residual: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
-        
-        # Use segmented attention
+
+        # Use segmented attention (LoRA is applied internally via wrapped projections)
         attn_output, attn_intermediates = self.segmented_attn(
             hidden_states,
             value_residual=value_residual,
             cache=past_key_value
         )
-        
+
         # Extract attention weights if requested
         attn_weights = None
         if output_attentions:
-            # Segmented attention doesn't return weights by default
-            # Could be extracted from attn_intermediates if needed
             attn_weights = None
 
         # Extract new cache
@@ -327,33 +442,18 @@ class TitanLLaMADecoderLayer(nn.Module):
         # ------------------------------------------------------------------
         # Self Attention
         # ------------------------------------------------------------------
-            with torch.no_grad():
-                hidden_states = self.input_layernorm(hidden_states)
-                
-                hidden_states, self_attn_weights, present_key_value, new_value_residual = self.self_attn(
-                    hidden_states=hidden_states,
-                    attention_mask=attention_mask,
-                    position_ids=position_ids,
-                    past_key_value=past_key_value,
-                    output_attentions=output_attentions,
-                    use_cache=use_cache,
-                    cache_position=cache_position,
-                    value_residual=value_residual,
-                )
+        hidden_states = self.input_layernorm(hidden_states)
 
-        else: 
-            hidden_states = self.input_layernorm(hidden_states)
-            
-            hidden_states, self_attn_weights, present_key_value, new_value_residual = self.self_attn(
-                hidden_states=hidden_states,
-                attention_mask=attention_mask,
-                position_ids=position_ids,
-                past_key_value=past_key_value,
-                output_attentions=output_attentions,
-                use_cache=use_cache,
-                cache_position=cache_position,
-                value_residual=value_residual,
-            )
+        hidden_states, self_attn_weights, present_key_value, new_value_residual = self.self_attn(
+            hidden_states=hidden_states,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_value=past_key_value,
+            output_attentions=output_attentions,
+            use_cache=use_cache,
+            cache_position=cache_position,
+            value_residual=value_residual,
+        )
 
         # If configured, gate attention output by retrieved memory
         if (
@@ -563,7 +663,7 @@ class TitanLLaMAForCausalLM(nn.Module):
             shift_logits = logits[..., :-1, :].contiguous()
             shift_labels = labels[..., 1:].contiguous()
             # Flatten the tokens
-            loss_fct = nn.CrossEntropyLoss()
+            loss_fct = nn.CrossEntropyLoss(ignore_index=-100)
             shift_logits = shift_logits.view(-1, self.vocab_size)
             shift_labels = shift_labels.view(-1)
             # Enable model parallelism
@@ -781,6 +881,12 @@ class TitanLLaMAForCausalLM(nn.Module):
             use_pretrained_backbone=False,
             base_model_name_or_path=base_model_name_or_path,
             freeze_backbone=True,
+            # LoRA config
+            use_lora=_get("use_lora", False),
+            lora_rank=_get("lora_rank", 8),
+            lora_alpha=_get("lora_alpha", 16),
+            lora_dropout=_get("lora_dropout", 0.0),
+            lora_layers_after_memory=_get("lora_layers_after_memory", 1),
         )
         
         # Create model and load weights
@@ -824,6 +930,12 @@ class TitanLLaMAForCausalLM(nn.Module):
                 "neural_mem_gate_attn_output": titan_config.neural_mem_gate_attn_output,
                 "neural_mem_weight_residual": titan_config.neural_mem_weight_residual,
                 "neural_mem_qkv_receives_diff_view": titan_config.neural_mem_qkv_receives_diff_view,
+                # LoRA config
+                "use_lora": titan_config.use_lora,
+                "lora_rank": titan_config.lora_rank,
+                "lora_alpha": titan_config.lora_alpha,
+                "lora_dropout": titan_config.lora_dropout,
+                "lora_layers_after_memory": titan_config.lora_layers_after_memory,
             }
 
         titan_cfg = TitanLLaMAConfig.from_llama_config(
@@ -859,6 +971,10 @@ class TitanLLaMAForCausalLM(nn.Module):
         model._load_llama_weights(base_model)
 
         model.backbone_model = base_model
+
+        for param in model.backbone_model.parameters():
+            param.requires_grad = False
+            
         model.backbone_model.eval().to(dtype=dtype, device='cuda')
 
         print("BACKBONE MODEL DEVICE:", next(model.backbone_model.parameters()).device)
@@ -896,8 +1012,18 @@ class TitanLLaMAForCausalLM(nn.Module):
                 k_weight = self._repeat_kv_weights(llama_layer.self_attn.k_proj.weight, num_kv_groups)
                 v_weight = self._repeat_kv_weights(llama_layer.self_attn.v_proj.weight, num_kv_groups)
                 to_qkv = torch.cat([q_weight, k_weight, v_weight], dim=0)
-                titan_layer.self_attn.segmented_attn.to_qkv.weight.copy_(to_qkv)
-                titan_layer.self_attn.segmented_attn.to_out.weight.copy_(llama_layer.self_attn.o_proj.weight)
+
+                # Handle LoRA-wrapped projections
+                qkv_layer = titan_layer.self_attn.segmented_attn.to_qkv
+                out_layer = titan_layer.self_attn.segmented_attn.to_out
+                if isinstance(qkv_layer, LoRALinear):
+                    qkv_layer.base_linear.weight.copy_(to_qkv)
+                else:
+                    qkv_layer.weight.copy_(to_qkv)
+                if isinstance(out_layer, LoRALinear):
+                    out_layer.base_linear.weight.copy_(llama_layer.self_attn.o_proj.weight)
+                else:
+                    out_layer.weight.copy_(llama_layer.self_attn.o_proj.weight)
 
                 # MLP
                 titan_layer.mlp.gate_proj.weight.copy_(llama_layer.mlp.gate_proj.weight)
@@ -907,8 +1033,10 @@ class TitanLLaMAForCausalLM(nn.Module):
     def freeze_backbone(self):
         """
         Freeze pretrained backbone weights.
-        Keep only the NeuralMemory *read-side adapter* trainable:
-        - to_queries, multihead_rmsnorm, retrieve_gate, combine_heads, etc.
+        Keep trainable:
+        - NeuralMemory read-side adapters (to_queries, retrieve_gate, etc.)
+        - LoRA adapters on attention projections (lora_A, lora_B)
+        - Persistent memory tokens
         """
 
         keys_to_freeze = [
@@ -924,15 +1052,23 @@ class TitanLLaMAForCausalLM(nn.Module):
 
         nm_total = 0
         nm_frozen = 0
+        lora_total = 0
 
         print("\n[freeze_backbone] ***** BEGIN *****")
 
         for name, param in self.named_parameters():
-            # persistent memory always trainable
+            # Persistent memory always trainable
             if "persistent_memory" in name:
                 param.requires_grad = True
                 continue
 
+            # LoRA parameters always trainable
+            if ".lora." in name or ".lora_" in name:
+                param.requires_grad = True
+                lora_total += param.numel()
+                continue
+
+            # Neural memory handling
             if "neural_memory" in name:
                 nm_total += param.numel()
 
@@ -943,10 +1079,11 @@ class TitanLLaMAForCausalLM(nn.Module):
                     param.requires_grad = True
                 continue
 
-            # everything else = backbone → frozen
+            # Everything else = backbone → frozen
             param.requires_grad = False
 
         print(f"[freeze_backbone] NM total params:  {nm_total:,}")
         print(f"[freeze_backbone] NM frozen params: {nm_frozen:,}")
         print(f"[freeze_backbone] NM trainable:     {nm_total - nm_frozen:,}")
+        print(f"[freeze_backbone] LoRA trainable:   {lora_total:,}")
         print("[freeze_backbone] ***** END *****\n")

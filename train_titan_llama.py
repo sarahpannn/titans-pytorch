@@ -43,9 +43,9 @@ from tqdm import tqdm
 
 # Import our TitanLLaMA implementation
 from titan_llama import TitanLLaMAConfig, TitanLLaMAForCausalLM
-from train_datasets import SlimPajamaDataset, FineWebEduDataset, BoolQDataset, WinograndeDataset, MixedEvalDataset, PubMedQADataset
+from train_datasets import SlimPajamaDataset, FineWebEduDataset, BoolQDataset, WinograndeDataset, MixedEvalDataset, PubMedQADataset, HugeMixedDataset, CaseHOLDDataset, AquaRATDataset
 from cuda_utils import log_cuda_mem
-from simple_eval import eval_winogrande_boolq, quick_eval_boolq, should_run_intermittent_eval, log_eval_metrics, eval_pubmedqa
+from simple_eval import eval_winogrande_boolq, quick_eval_boolq, should_run_intermittent_eval, log_eval_metrics, eval_pubmedqa, eval_commonsenseqa, eval_drop, eval_squadv2, eval_casehold, eval_aquarat, eval_boolq, eval_winogrande
 
 
 def compute_attention_distillation_loss(
@@ -185,7 +185,15 @@ class TrainingConfig:
     use_attention_distillation: bool = False
     distillation_weight: float = 0.1  # Weight for distillation loss vs LM loss
     distillation_layers: tuple = (8, 16, 24)  # Which layers to apply distillation to
-    
+
+    # LoRA configuration for attention adaptation
+    use_lora: bool = False
+    lora_rank: int = 8
+    lora_alpha: int = 16
+    lora_dropout: float = 0.0
+    lora_layers_after_memory: int = 1  # How many layers after each memory layer get LoRA
+    lora_learning_rate: float = 1e-4  # Separate LR for LoRA parameters
+
     # Optimization
     warmup_steps: int = 2000
     eval_interval: int = 1000
@@ -284,6 +292,12 @@ def create_model_and_optimizer(config: TrainingConfig, device):
         use_pretrained_backbone=config.use_pretrained_backbone,
         base_model_name_or_path=config.base_model_name,
         freeze_backbone=config.freeze_backbone,
+        # LoRA configuration
+        use_lora=config.use_lora,
+        lora_rank=config.lora_rank,
+        lora_alpha=config.lora_alpha,
+        lora_dropout=config.lora_dropout,
+        lora_layers_after_memory=config.lora_layers_after_memory,
     )
     
     # Create model
@@ -335,6 +349,8 @@ def create_model_and_optimizer(config: TrainingConfig, device):
             bucket_counts["nm_read_side"] += p.numel()
         elif "persistent_memory" in name:
             bucket_counts["persistent_memory"] += p.numel()
+        elif ".lora." in name or ".lora_" in name:
+            bucket_counts["lora"] += p.numel()
         else:
             bucket_counts["other"] += p.numel()
 
@@ -342,8 +358,9 @@ def create_model_and_optimizer(config: TrainingConfig, device):
         for k, v in bucket_counts.items():
             print(f"  - {k:18s}: {v:,} ({v/1e6:.2f}M)")
 
-        # Separate neural memory parameters for different optimization
+        # Separate parameters for different optimization: neural memory, LoRA, and regular
         neural_memory_params = []
+        lora_params = []
         regular_params = []
 
         for name, param in model.named_parameters():
@@ -351,12 +368,14 @@ def create_model_and_optimizer(config: TrainingConfig, device):
                 continue
             if 'neural_memory' in name:
                 neural_memory_params.append(param)
+            elif '.lora.' in name or '.lora_' in name:
+                lora_params.append(param)
             else:
                 regular_params.append(param)
 
         # print(f"\n[create_model_and_optimizer] #trainable nm params: {sum(p.numel() for p in neural_memory_params):,}")
         # print(f"[create_model_and_optimizer] #trainable non-nm params: {sum(p.numel() for p in regular_params):,}\n")
-    
+
     # Create optimizers
     optimizer_groups = []
 
@@ -367,7 +386,7 @@ def create_model_and_optimizer(config: TrainingConfig, device):
             'weight_decay': config.weight_decay,
             'betas': (config.beta1, config.beta2)
         })
-    
+
     if neural_memory_params:
         optimizer_groups.append({
             'params': neural_memory_params,
@@ -376,6 +395,15 @@ def create_model_and_optimizer(config: TrainingConfig, device):
             'betas': (config.neural_mem_momentum, config.beta2)
         })
         print(f"Neural memory parameters: {sum(p.numel() for p in neural_memory_params):,}")
+
+    if lora_params:
+        optimizer_groups.append({
+            'params': lora_params,
+            'lr': config.lora_learning_rate,
+            'weight_decay': config.weight_decay,
+            'betas': (config.beta1, config.beta2)
+        })
+        print(f"LoRA parameters: {sum(p.numel() for p in lora_params):,}")
     
     if not optimizer_groups:
         raise ValueError("No trainable parameters were found. Ensure backbone freezing is configured correctly.")
@@ -488,7 +516,7 @@ def load_pretrained_from_checkpoint(model, checkpoint_path: str):
 
 def evaluate_model(model, eval_dataloader, device, max_eval_steps=100):
     """Evaluate model on validation set."""
-    model.eval()
+    # model.eval()
     total_loss = 0
     total_accuracy = 0
     num_steps = 0
@@ -514,7 +542,7 @@ def evaluate_model(model, eval_dataloader, device, max_eval_steps=100):
             total_accuracy += outputs['correct']
             num_steps += 1
     
-    model.train()
+    # model.train()
 
     return {
         'loss': total_loss / num_steps if num_steps > 0 else float('inf'),
@@ -637,18 +665,16 @@ def main(config=None):
         )
 
     elif 'mixed' in config.dataset_name:
-        train_dataset = MixedEvalDataset(
+        train_dataset = HugeMixedDataset(
             tokenizer_name=config.tokenizer_name,
             max_length=config.sequence_length,
-            boolq_split="train", 
-            winogrande_split="train",
-        )
+            split="train",
+        )   
 
-        eval_dataset = MixedEvalDataset(
+        eval_dataset = HugeMixedDataset(
             tokenizer_name=config.tokenizer_name,
             max_length=config.sequence_length,
-            boolq_split="validation" if "validation" in ["train"] else "train",  # Use train split for now 
-            winogrande_split="validation" if "validation" in ["train"] else "train",  # Use train split for now
+            split="validation",
         )
 
     elif 'pubmed' in config.dataset_name:
@@ -664,9 +690,35 @@ def main(config=None):
             split="train",
         )
 
+    elif 'casehold' in config.dataset_name:
+        train_dataset = CaseHOLDDataset(
+            tokenizer_name=config.tokenizer_name,
+            max_length=config.sequence_length,
+            split="train",
+        )
+
+        eval_dataset = CaseHOLDDataset(
+            tokenizer_name=config.tokenizer_name,
+            max_length=config.sequence_length,
+            split="validation" if "validation" in ["train"] else "train",  # Use train split for now
+        )
+    
+    elif 'aquarat' in config.dataset_name:
+        train_dataset = AquaRATDataset(
+            tokenizer_name=config.tokenizer_name,
+            max_length=config.sequence_length,
+            split="train",
+        )
+
+        eval_dataset = AquaRATDataset(
+            tokenizer_name=config.tokenizer_name,
+            max_length=config.sequence_length,
+            split="validation" if "validation" in ["train"] else "train",  # Use train split for now
+        )
+
     else: raise RuntimeError("Could not infer dataset")
 
-    finetune_keywords = ("winogrande", "mixed", "pubmed", "boolq")
+    finetune_keywords = ("winogrande", "mixed", "pubmed", "boolq", "casehold", "aquarat")
     if any(k in config.dataset_name.lower() for k in finetune_keywords):
         # steps per epoch = ceil(len(dataset) / (micro_batch_size * grad_acc_steps))
         steps_per_epoch = math.ceil(
@@ -775,9 +827,10 @@ def main(config=None):
                 )
                 distill_loss = distill_loss / config.gradient_accumulation_steps
             
-            # Combine losses
-            total_loss = lm_loss + config.distillation_weight * distill_loss
-            loss = total_loss
+            # Combine losses, with distillation schedule
+            # effective_dist_weight = config.distillation_weight * (1 - step / config.total_steps)
+            # total_loss = lm_loss + effective_dist_weight * distill_loss
+            loss = lm_loss * (1 - config.distillation_weight) + distill_loss * config.distillation_weight
 
             # if step == 0:
             #     log_cuda_mem("after forward")
@@ -807,7 +860,7 @@ def main(config=None):
         #     break
         
         # Reset memory states periodically to prevent memory leaks
-        if step % 100 == 0:
+        if step % 10 == 0:
             model.reset_memory_states()
         
         # Logging
@@ -847,7 +900,8 @@ def main(config=None):
                     'train/accuracy': avg_acc / config.gradient_accumulation_steps,
                     'train/learning_rate': lr,
                     'train/step': step,
-                    'train/tokens_processed': step * config.tokens_per_batch
+                    'train/tokens_processed': step * config.tokens_per_batch,
+                    # 'train/dist_weight': effective_dist_weight,
                 }
                 
                 if config.use_attention_distillation:
@@ -900,18 +954,64 @@ def main(config=None):
                     model.module.reset_memory_states()
             except Exception as e:
                 logger.warning(f"Failed to reset memory states before eval: {str(e)}")
-            if config.dataset_name in ['mixed', 'winogrande', 'boolq']:
-                eval_metrics = eval_mixed_boolq_winogrande(
+            if config.dataset_name in ['mixed', 'winogrande', 'boolq', 'HuggingFaceFW/fineweb-edu']:
+                # eval_metrics = eval_mixed_boolq_winogrande(
+                #     model=model,
+                #     tokenizer=tokenizer,
+                #     device=device,
+                #     max_examples=config.intermittent_eval_limit,
+                #     boolq_batch_size=config.micro_batch_size,
+                # )
+                eval_metrics = eval_boolq(
                     model=model,
                     tokenizer=tokenizer,
                     device=device,
                     max_examples=config.intermittent_eval_limit,
-                    boolq_batch_size=config.micro_batch_size,
+                    batch_size=config.micro_batch_size,
                 )
+                winogrande_metrics = eval_winogrande(
+                    model=model,
+                    tokenizer=tokenizer,
+                    device=device,
+                    max_examples=config.intermittent_eval_limit,
+                    batch_size=config.micro_batch_size,
+                )
+
+                commonqa_metrics = eval_commonsenseqa(
+                    model=model,
+                    tokenizer=tokenizer,
+                    device=device,
+                    max_examples=config.intermittent_eval_limit,
+                    batch_size=config.micro_batch_size,
+                )
+                squad2 = eval_squadv2(
+                    model=model,
+                    tokenizer=tokenizer,
+                    device=device,
+                    max_examples=config.intermittent_eval_limit,
+                    batch_size=config.micro_batch_size,
+                )
+                drop_metrics = eval_drop(
+                    model=model,
+                    tokenizer=tokenizer,
+                    device=device,
+                    max_examples=config.intermittent_eval_limit,
+                    batch_size=config.micro_batch_size,
+                )
+
+                eval_metrics.update(winogrande_metrics)
+
+                eval_metrics.update(commonqa_metrics)
+                eval_metrics.update(drop_metrics)
+                eval_metrics.update(squad2)
+
                 logger.info(
                 f"[eval] step {step} "
                 f"BoolQ acc={eval_metrics['boolq_acc']:.3f}, "
                 f"Winogrande acc={eval_metrics['winogrande_acc']:.3f}"
+                f"CommonsenseQA acc={eval_metrics['commonsenseqa_acc']:.3f}, "
+                f"DROP F1={eval_metrics['drop_acc']:.3f}, "
+                f"SQuAD2 F1={eval_metrics['squadv2_acc']:.3f} "
             )
             elif 'pubmed' in config.dataset_name:
                 eval_metrics = eval_pubmedqa(
@@ -926,8 +1026,34 @@ def main(config=None):
                 f"[eval] step {step} "
                 f"pubmedqa acc={eval_metrics['pubmedqa_acc']:.3f}, "
                 )
+            elif 'casehold' in config.dataset_name:
+                eval_metrics = eval_casehold(
+                    model=model,
+                    tokenizer=tokenizer,
+                    device=device,
+                    max_examples=config.intermittent_eval_limit,
+                    batch_size=config.micro_batch_size,
+                    max_input_len=config.sequence_length,
+                )
+                logger.info(
+                f"[eval] step {step} "
+                f"casehold acc={eval_metrics['casehold_acc']:.3f}, "
+                )
+            elif 'aquarat' in config.dataset_name:
+                eval_metrics = eval_aquarat(
+                    model=model,
+                    tokenizer=tokenizer,
+                    device=device,
+                    max_examples=config.intermittent_eval_limit,
+                    batch_size=config.micro_batch_size,
+                    max_input_len=config.sequence_length,
+                )
+                logger.info(
+                f"[eval] step {step} "
+                f"aquarat acc={eval_metrics['aquarat_acc']:.3f}, "
+                )
             else:
-                logger.warning(f"Intermittent evaluation not implemented for dataset {config.train_dataset}")
+                logger.warning(f"Intermittent evaluation not implemented for dataset {config.dataset_name}")
                 eval_metrics = {}
 
             

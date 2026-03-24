@@ -42,6 +42,7 @@ def parse_args():
     parser.add_argument("--micro_batch_size", type=int, default=1, help="Micro batch size")
     parser.add_argument("--sequence_length", type=int, default=2048, help="Sequence length")
     parser.add_argument("--learning_rate", type=float, default=3e-4, help="Learning rate")
+    parser.add_argument("--min_learning_rate", type=float, default=1e-9, help="For scheduler")
     parser.add_argument("--neural_mem_lr", type=float, default=1e-2, help="Neural memory learning rate")
     parser.add_argument("--warmup_steps", type=int, default=2000, help="Warmup steps")
     parser.add_argument("--weight_decay", type=float, default=0.1, help="Weight decay")
@@ -72,13 +73,27 @@ def parse_args():
     parser.add_argument("--pretrained_from_checkpoint", type=str, default=None, help="Initialize model weights from this checkpoint but start training from step 0.")
     
     # Attention Distillation
-    parser.add_argument("--use_attention_distillation", action="store_true", 
+    parser.add_argument("--use_attention_distillation", action="store_true",
                        help="Enable attention distillation loss")
     parser.add_argument("--distillation_weight", type=float, default=0.1,
                        help="Weight for distillation loss vs LM loss (default: 0.1)")
     parser.add_argument("--distillation_layers", type=str, default="8,16,24",
                        help="Comma-separated layer indices for distillation (default: 8,16,24)")
-    
+
+    # LoRA for attention adaptation
+    parser.add_argument("--use_lora", action="store_true",
+                       help="Enable LoRA adapters on attention layers near neural memory")
+    parser.add_argument("--lora_rank", type=int, default=8,
+                       help="Rank of LoRA matrices (default: 8)")
+    parser.add_argument("--lora_alpha", type=int, default=16,
+                       help="LoRA scaling factor alpha (default: 16)")
+    parser.add_argument("--lora_dropout", type=float, default=0.0,
+                       help="Dropout for LoRA layers (default: 0.0)")
+    parser.add_argument("--lora_layers_after_memory", type=int, default=1,
+                       help="Number of layers after each memory layer to add LoRA (default: 1)")
+    parser.add_argument("--lora_lr", type=float, default=1e-4,
+                       help="Learning rate for LoRA parameters (default: 1e-4)")
+
     # Other options
     parser.add_argument("--no_wandb", action="store_true", help="Disable wandb logging")
     parser.add_argument("--debug", action="store_true", help="Enable debug mode")
@@ -120,6 +135,7 @@ def create_config_from_args(args):
         micro_batch_size=args.micro_batch_size,
         sequence_length=args.sequence_length,
         learning_rate=args.learning_rate,
+        min_learning_rate=args.min_learning_rate,
         neural_mem_learning_rate=args.neural_mem_lr,
         warmup_steps=args.warmup_steps,
         weight_decay=args.weight_decay,
@@ -149,6 +165,14 @@ def create_config_from_args(args):
         use_attention_distillation=args.use_attention_distillation,
         distillation_weight=args.distillation_weight,
         distillation_layers=distillation_layers,
+
+        # LoRA config
+        use_lora=args.use_lora,
+        lora_rank=args.lora_rank,
+        lora_alpha=args.lora_alpha,
+        lora_dropout=args.lora_dropout,
+        lora_layers_after_memory=args.lora_layers_after_memory,
+        lora_learning_rate=args.lora_lr,
     )
     
     # Debug mode adjustments
@@ -195,6 +219,11 @@ def main_with_args():
     if config.use_attention_distillation:
         print(f"  Weight: {config.distillation_weight}")
         print(f"  Layers: {config.distillation_layers}")
+    print(f"LoRA Adapters: {config.use_lora}")
+    if config.use_lora:
+        print(f"  Rank: {config.lora_rank}, Alpha: {config.lora_alpha}")
+        print(f"  Layers after memory: {config.lora_layers_after_memory}")
+        print(f"  LoRA LR: {config.lora_learning_rate}")
     print(f"Learning Rate: {config.learning_rate}")
     print(f"Neural Memory LR: {config.neural_mem_learning_rate}")
     print(f"Output Directory: {config.output_dir}")

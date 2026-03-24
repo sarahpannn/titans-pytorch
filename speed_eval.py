@@ -454,7 +454,7 @@ def main() -> None:
     print(f"[info] using prompt_length = {prompt_len} tokens")
 
     # Generation lengths to sweep
-    gen_lengths = [16, 32, 64, 128, 256, 512, 1024]
+    gen_lengths = [16, 32, 64, 128, 256, 512, 1024, 2048, 4096]
     # gen_lengths.reverse()
 
     all_results: List[dict] = []

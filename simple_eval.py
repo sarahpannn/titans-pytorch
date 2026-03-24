@@ -6,7 +6,7 @@ All evaluations use the same core approach:
 - Consistent memory reset handling for Titan models
 - Unified interface via `MultipleChoiceEvaluator`
 
-Supported datasets: BoolQ, Winogrande, PubMedQA, MMLU, HellaSwag, ARC, PIQA, AQuA-RAT
+Supported datasets: BoolQ, Winogrande, PubMedQA, MMLU, HellaSwag, ARC, PIQA
 """
 
 import math
@@ -286,23 +286,6 @@ def load_piqa(max_examples: Optional[int] = None, split: str = "validation") -> 
     ]
 
 
-def load_aqua_rat(max_examples: Optional[int] = None, split: str = "validation") -> List[Dict]:
-    """Load AQuA-RAT dataset (algebraic reasoning with rationales)."""
-    ds = load_dataset("deepmind/aqua_rat", split=split)
-    if max_examples is not None:
-        ds = ds.select(range(min(max_examples, len(ds))))
-    
-    return [
-        {
-            "question": ex["question"],
-            "choices": ex["options"],  # List of 5 options (A-E)
-            "answer": ord(ex["correct"]) - ord("A"),  # Convert "A"-"E" to 0-4
-            "rationale": ex.get("rationale", ""),
-        }
-        for ex in ds
-    ]
-
-
 def load_casehold(max_examples: Optional[int] = None, split: str = "validation") -> List[Dict]:
     """Load LexGLUE CaseHOLD dataset."""
     ds = load_dataset("coastalcph/lex_glue", "case_hold", split=split)
@@ -350,24 +333,23 @@ def load_drop(max_examples: Optional[int] = None, split: str = "validation") -> 
     """
     Load DROP dataset.
     
-    DROP is an extractive/generative QA task, but we convert it to multiple-choice
-    by treating the gold answers as one option and generating distractors.
-    For simplicity, we evaluate using exact match on generated text.
+    DROP is converted to multiple-choice by using spans from the passage as distractors.
+    This is faster than generative evaluation while still testing reading comprehension.
     """
     ds = load_dataset("ucinlp/drop", split=split)
     if max_examples is not None:
         ds = ds.select(range(min(max_examples, len(ds))))
     
+    import random
+    random.seed(42)  # Reproducibility
+    
     data = []
     for ex in ds:
-        # DROP has multiple valid answers
+        # Get the gold answer(s)
         answers_spans = ex.get("answers_spans", {})
         spans = answers_spans.get("spans", [])
-        
-        # Also check for number answers
         number_answer = ex.get("answer", {}).get("number", "")
         
-        # Collect all valid answers
         valid_answers = []
         if spans:
             valid_answers.extend(spans)
@@ -377,37 +359,134 @@ def load_drop(max_examples: Optional[int] = None, split: str = "validation") -> 
         if not valid_answers:
             continue
         
+        gold_answer = valid_answers[0]  # Use first valid answer
+        
+        # Generate distractors from passage (simple heuristic: extract spans)
+        passage = ex["passage"]
+        words = passage.split()
+        
+        # Create distractors by sampling random spans from passage
+        distractors = set()
+        gold_words = set(gold_answer.lower().split())
+        
+        # Try to find plausible distractors (similar length spans)
+        gold_len = len(gold_answer.split())
+        for _ in range(50):  # Try up to 50 times to find good distractors
+            if len(distractors) >= 3:
+                break
+            if len(words) > gold_len:
+                start = random.randint(0, len(words) - gold_len)
+                candidate = " ".join(words[start:start + gold_len])
+                # Don't use if too similar to gold
+                if candidate.lower() != gold_answer.lower() and \
+                   not set(candidate.lower().split()).intersection(gold_words):
+                    distractors.add(candidate)
+        
+        # Fall back to generic distractors if needed
+        fallbacks = ["none", "unknown", "not mentioned", "0", "1", "2"]
+        while len(distractors) < 3:
+            distractors.add(fallbacks[len(distractors)])
+        
+        distractors = list(distractors)[:3]
+        
+        # Shuffle choices
+        choices = [gold_answer] + distractors
+        answer_idx = 0
+        indices = list(range(len(choices)))
+        random.shuffle(indices)
+        choices = [choices[i] for i in indices]
+        answer_idx = indices.index(0)  # Where did the gold answer end up?
+        
         data.append({
-            "passage": ex["passage"],
+            "passage": passage,
             "question": ex["question"],
-            "answers": valid_answers,  # List of acceptable answers
+            "choices": choices,
+            "answer": answer_idx,
+            "gold_answers": valid_answers,  # Keep for reference
         })
     
     return data
 
 
-def load_squadv2(max_examples: Optional[int] = None, split: str = "validation") -> List[Dict]:
+def load_squadv2_mc(
+    max_examples: Optional[int] = None,
+    split: str = "validation",
+) -> List[Dict]:
     """
-    Load SQuAD v2 dataset.
-    
-    SQuAD v2 includes unanswerable questions (where answers is empty).
+    Fast SQuAD v2 loader that converts each question into a small MC problem.
+
+    We build 4-way multiple choice:
+      - if answerable: one option is the gold span, 3 are distractors from the context
+      - if unanswerable: gold option is 'unanswerable', 3 are distractor spans
     """
     ds = load_dataset("rajpurkar/squad_v2", split=split)
     if max_examples is not None:
         ds = ds.select(range(min(max_examples, len(ds))))
-    
+
+    import random
+    random.seed(42)
+
     data = []
     for ex in ds:
+        context = ex["context"]
+        question = ex["question"]
         answers = ex["answers"]["text"]
         is_impossible = len(answers) == 0
-        
+
+        # Gold text
+        if is_impossible:
+            gold_answer = "unanswerable"
+            gold_answers = ["unanswerable", "no answer", ""]
+        else:
+            # Use first annotated span as the gold
+            gold_answer = answers[0].strip()
+            gold_answers = answers
+
+        # Build distractors from context (similar to DROP)
+        words = context.split()
+        distractors = set()
+
+        gold_words = set(gold_answer.lower().split()) if gold_answer else set()
+        gold_len = max(1, len(gold_answer.split())) if gold_answer else 3
+
+        for _ in range(50):
+            if len(distractors) >= 3:
+                break
+            if len(words) > gold_len:
+                start = random.randint(0, len(words) - gold_len)
+                candidate = " ".join(words[start:start + gold_len]).strip()
+                if not candidate:
+                    continue
+                if candidate.lower() == gold_answer.lower():
+                    continue
+                cand_words = set(candidate.lower().split())
+                if cand_words & gold_words:
+                    continue
+                distractors.add(candidate)
+
+        # Generic fallbacks if we don't find enough spans
+        fallbacks = ["none", "unknown", "not mentioned", "no answer"]
+        while len(distractors) < 3:
+            distractors.add(fallbacks[len(distractors)])
+
+        distractors = list(distractors)[:3]
+
+        # Build and shuffle choices
+        choices = [gold_answer] + distractors
+        idxs = list(range(len(choices)))
+        random.shuffle(idxs)
+        choices = [choices[i] for i in idxs]
+        answer_idx = idxs.index(0)  # where the gold ended up
+
         data.append({
-            "context": ex["context"],
-            "question": ex["question"],
-            "answers": answers if answers else [""],  # Empty string for unanswerable
+            "context": context,
+            "question": question,
+            "choices": choices,
+            "answer": answer_idx,
+            "gold_answers": gold_answers,
             "is_impossible": is_impossible,
         })
-    
+
     return data
 
 
@@ -420,18 +499,18 @@ def load_squadv2(max_examples: Optional[int] = None, split: str = "validation") 
 EVAL_BATCH_SIZE_DEFAULTS = {
     "boolq": 8,
     "winogrande": 16,
-    "pubmedqa": 2,      # Long contexts
+    "pubmedqa": 2,
     "mmlu": 4,
     "hellaswag": 4,
     "arc": 8,
     "arc_easy": 8,
     "arc_challenge": 8,
     "piqa": 8,
-    "aqua_rat": 4,       # Math reasoning
-    "casehold": 2,       # Long legal contexts
+    "casehold": 4,
     "commonsenseqa": 8,
-    "drop": 2,           # Generative, long contexts
-    "squadv2": 2,        # Generative, long contexts
+    "drop": 4,
+    "squadv2": 4,
+    "aquarat": 4,
 }
 
 # Maximum batch size for evaluation (safety cap)
@@ -568,24 +647,30 @@ class MultipleChoiceEvaluator:
             candidates.append(f"{prompt}Answer: {letter}. {choice}")
         
         return candidates, ex["answer"]
-    
+
+    def _format_aquarat(self, ex: Dict) -> Tuple[List[str], int]:
+        """
+        Format Aqua-RAT example into candidate sequences (pure MC, no rationale).
+        """
+        question = ex["question"]
+        options = ex.get("options") or ex.get("choices")
+        assert options is not None and len(options) > 0
+
+        prompt = "Question: " + question + "\nOptions:\n"
+        letters: List[str] = []
+        for i, opt in enumerate(options):
+            letter = chr(ord("A") + i)
+            letters.append(letter)
+            prompt += f"{letter}) {opt}\n"
+
+        base = prompt + "Answer:"
+        candidates = [f"{base} {letter}" for letter in letters]
+        return candidates, ex["answer"]
+
     def _format_piqa(self, ex: Dict) -> Tuple[List[str], int]:
         """Format PIQA example into candidate sequences."""
         goal = ex["goal"]
         candidates = [f"Goal: {goal}\nSolution: {choice}" for choice in ex["choices"]]
-        return candidates, ex["answer"]
-    
-    def _format_aqua_rat(self, ex: Dict) -> Tuple[List[str], int]:
-        """Format AQuA-RAT example into candidate sequences."""
-        question = ex["question"]
-        choices = ex["choices"]
-        
-        prompt = f"Question: {question}\n"
-        candidates = []
-        for i, choice in enumerate(choices):
-            letter = chr(ord('A') + i)
-            candidates.append(f"{prompt}Answer: {letter}. {choice}")
-        
         return candidates, ex["answer"]
     
     def _format_casehold(self, ex: Dict) -> Tuple[List[str], int]:
@@ -604,6 +689,25 @@ class MultipleChoiceEvaluator:
         # Each candidate is the prompt + the answer letter
         candidates = [f"{prompt} {option_letters[i]}" for i in range(len(choices))]
         return candidates, ex["answer"]
+
+    def _format_squadv2(self, ex: Dict) -> Tuple[List[str], int]:
+        """
+        Multiple-choice formatting for SQuAD v2.
+
+        We show a truncated context + question and attach each answer option.
+        """
+        context = ex["context"]
+        question = ex["question"]
+        choices = ex["choices"]
+
+        # Truncate context to keep things sane
+        words = context.split()
+        if len(words) > 200:
+            context = " ".join(words[:200]) + " ..."
+
+        prompt = f"Context: {context}\n\nQuestion: {question}\n\nAnswer:"
+        candidates = [f"{prompt} {choice}" for choice in choices]
+        return candidates, ex["answer"]
     
     def _format_commonsenseqa(self, ex: Dict) -> Tuple[List[str], int]:
         """Format CommonsenseQA example into candidate sequences."""
@@ -617,6 +721,22 @@ class MultipleChoiceEvaluator:
             letter = choice_labels[i] if i < len(choice_labels) else chr(ord('A') + i)
             candidates.append(f"{prompt}Answer: {letter}. {choice}")
         
+        return candidates, ex["answer"]
+    
+    def _format_drop(self, ex: Dict) -> Tuple[List[str], int]:
+        """Format DROP example into candidate sequences (multiple-choice version)."""
+        passage = ex["passage"]
+        question = ex["question"]
+        choices = ex["choices"]
+        
+        # Truncate passage if too long to fit in context
+        max_passage_words = 200
+        passage_words = passage.split()
+        if len(passage_words) > max_passage_words:
+            passage = " ".join(passage_words[:max_passage_words]) + "..."
+        
+        prompt = f"Passage: {passage}\n\nQuestion: {question}\n\nAnswer:"
+        candidates = [f"{prompt} {choice}" for choice in choices]
         return candidates, ex["answer"]
     
     def _evaluate_batch(
@@ -699,9 +819,9 @@ class MultipleChoiceEvaluator:
                 "arc_easy": lambda **kw: load_arc(challenge=False, **kw),
                 "arc_challenge": lambda **kw: load_arc(challenge=True, **kw),
                 "piqa": load_piqa,
-                "aqua_rat": load_aqua_rat,
                 "casehold": load_casehold,
                 "commonsenseqa": load_commonsenseqa,
+                "drop": load_drop,
             }
             if dataset not in loaders:
                 raise ValueError(f"Unknown dataset: {dataset}. Available: {list(loaders.keys())}")
@@ -720,9 +840,11 @@ class MultipleChoiceEvaluator:
             "arc_easy": self._format_arc,
             "arc_challenge": self._format_arc,
             "piqa": self._format_piqa,
-            "aqua_rat": self._format_aqua_rat,
             "casehold": self._format_casehold,
             "commonsenseqa": self._format_commonsenseqa,
+            "drop": self._format_drop,
+            "squadv2": self._format_squadv2,    # NEW
+            "aquarat": self._format_aquarat,    # NEW
         }
         format_fn = formatters[dataset]
         
@@ -842,6 +964,8 @@ def _generate_answers_batch(
 ) -> List[str]:
     """Generate answers for a batch of prompts."""
     _reset_memory(model)
+
+    print(prompts)
     
     enc = tokenizer(
         prompts,
@@ -852,13 +976,13 @@ def _generate_answers_batch(
     ).to(device)
     
     with torch.no_grad():
-        outputs = model.generate(
+        outputs = model.generate_with_titan_memory(
             input_ids=enc["input_ids"],
-            attention_mask=enc["attention_mask"],
+            # attention_mask=enc["attention_mask"],
             max_new_tokens=max_new_tokens,
             do_sample=False,
-            pad_token_id=tokenizer.pad_token_id,
-            eos_token_id=tokenizer.eos_token_id,
+            # pad_token_id=tokenizer.pad_token_id,
+            # eos_token_id=tokenizer.eos_token_id,
         )
     
     # Decode only the generated part
@@ -922,13 +1046,21 @@ class GenerativeEvaluator:
         prompt = f"Passage: {ex['passage']}\n\nQuestion: {ex['question']}\n\nAnswer:"
         return prompt, ex["answers"]
     
-    def _format_squadv2(self, ex: Dict) -> Tuple[str, List[str]]:
-        """Format SQuAD v2 example into prompt and ground truth answers."""
-        prompt = f"Context: {ex['context']}\n\nQuestion: {ex['question']}\n\nAnswer:"
-        # For unanswerable questions, the expected answer is empty/unanswerable
-        if ex["is_impossible"]:
-            return prompt, ["unanswerable", "no answer", ""]
-        return prompt, ex["answers"]
+    def _format_squadv2(self, ex: Dict) -> Tuple[List[str], int]:
+        """Format SQuAD v2 example into candidate sequences (MC version)."""
+        context = ex["context"]
+        question = ex["question"]
+        choices = ex["choices"]
+
+        # Truncate context a bit so we fit in max_length
+        max_context_words = 300
+        words = context.split()
+        if len(words) > max_context_words:
+            context = " ".join(words[:max_context_words]) + "..."
+
+        prompt = f"Context: {context}\n\nQuestion: {question}\n\nAnswer:"
+        candidates = [f"{prompt} {choice}" for choice in choices]
+        return candidates, ex["answer"]
     
     def evaluate(
         self,
@@ -951,7 +1083,7 @@ class GenerativeEvaluator:
         if data is None:
             loaders = {
                 "drop": load_drop,
-                "squadv2": load_squadv2,
+                "squadv2": load_squadv2_mc
             }
             if dataset not in loaders:
                 raise ValueError(f"Unknown generative dataset: {dataset}")
@@ -1028,7 +1160,7 @@ def eval_boolq(
     batch_size: int = 8,
     max_input_len: int = 512,
     max_examples: Optional[int] = None,
-) -> float:
+) -> Dict[str, float]:
     """
     Evaluate BoolQ using sequence log-probability scoring.
     Returns accuracy in [0, 1].
@@ -1041,7 +1173,7 @@ def eval_boolq(
         max_length=max_input_len,
     )
     result = evaluator.evaluate("boolq", data=boolq_data, max_examples=max_examples)
-    return result.accuracy
+    return {'boolq_acc': result.accuracy}
 
 
 def eval_winogrande(
@@ -1052,10 +1184,10 @@ def eval_winogrande(
     batch_size: int = 8,
     max_input_len: int = 256,
     max_examples: Optional[int] = None,
-) -> float:
+) -> Dict[str, float]:
     """
     Evaluate Winogrande using sequence log-probability scoring.
-    Returns accuracy in [0, 1].
+    Returns winogra
     """
     evaluator = MultipleChoiceEvaluator(
         model=model,
@@ -1065,7 +1197,7 @@ def eval_winogrande(
         max_length=max_input_len,
     )
     result = evaluator.evaluate("winogrande", data=winogrande_data, max_examples=max_examples)
-    return result.accuracy
+    return {"winogrande_acc": result.accuracy}
 
 
 def eval_pubmedqa(
@@ -1193,31 +1325,6 @@ def eval_piqa(
     return {"piqa_acc": result.accuracy}
 
 
-def eval_aqua_rat(
-    model: PreTrainedModel,
-    tokenizer: PreTrainedTokenizerBase,
-    device: Union[torch.device, str] = "cuda",
-    batch_size: int = 4,
-    max_input_len: int = 512,
-    max_examples: Optional[int] = None,
-    split: str = "validation",
-) -> Dict[str, float]:
-    """
-    Evaluate AQuA-RAT (algebraic reasoning with rationales).
-    Returns {"aqua_rat_acc": float}.
-    """
-    data = load_aqua_rat(max_examples=max_examples, split=split)
-    evaluator_obj = MultipleChoiceEvaluator(
-        model=model,
-        tokenizer=tokenizer,
-        device=device,
-        batch_size=batch_size,
-        max_length=max_input_len,
-    )
-    result = evaluator_obj.evaluate("aqua_rat", data=data)
-    return {"aqua_rat_acc": result.accuracy}
-
-
 def eval_casehold(
     model: PreTrainedModel,
     tokenizer: PreTrainedTokenizerBase,
@@ -1274,25 +1381,28 @@ def eval_drop(
     device: Union[torch.device, str] = "cuda",
     batch_size: int = 4,
     max_input_len: int = 512,
-    max_new_tokens: int = 32,
+    max_new_tokens: int = 32,  # Unused, kept for API compatibility
     max_examples: Optional[int] = None,
     split: str = "validation",
 ) -> Dict[str, float]:
     """
-    Evaluate DROP (generative QA).
-    Returns {"drop_em": float, "drop_f1": float}.
+    Evaluate DROP as multiple-choice (fast version).
+    
+    This converts DROP to a 4-way multiple choice task by generating distractors
+    from the passage. Much faster than generative evaluation.
+    
+    Returns {"drop_acc": float}.
     """
     data = load_drop(max_examples=max_examples, split=split)
-    evaluator_obj = GenerativeEvaluator(
+    evaluator_obj = MultipleChoiceEvaluator(
         model=model,
         tokenizer=tokenizer,
         device=device,
         batch_size=batch_size,
-        max_input_len=max_input_len,
-        max_new_tokens=max_new_tokens,
+        max_length=max_input_len,
     )
     result = evaluator_obj.evaluate("drop", data=data)
-    return {"drop_em": result.exact_match, "drop_f1": result.f1}
+    return {"drop_acc": result.accuracy}
 
 
 def eval_squadv2(
@@ -1309,17 +1419,16 @@ def eval_squadv2(
     Evaluate SQuAD v2 (generative QA with unanswerable questions).
     Returns {"squadv2_em": float, "squadv2_f1": float}.
     """
-    data = load_squadv2(max_examples=max_examples, split=split)
-    evaluator_obj = GenerativeEvaluator(
+    data = load_squadv2_mc(max_examples=max_examples, split=split)
+    evaluator_obj = MultipleChoiceEvaluator(
         model=model,
         tokenizer=tokenizer,
         device=device,
         batch_size=batch_size,
-        max_input_len=max_input_len,
-        max_new_tokens=max_new_tokens,
+        max_length=max_input_len,
     )
     result = evaluator_obj.evaluate("squadv2", data=data)
-    return {"squadv2_em": result.exact_match, "squadv2_f1": result.f1}
+    return {"squadv2_acc": result.accuracy}
 
 
 # =============================================================================
@@ -1429,16 +1538,16 @@ def eval_all_benchmarks(
         max_length: Maximum sequence length
         max_examples: Maximum examples per dataset
         datasets: List of dataset names to evaluate (default: all multiple-choice)
-        include_generative: Whether to include generative tasks (DROP, SQuAD v2)
+        include_generative: Whether to include SQuAD v2 (generative). DROP is now MC.
     
     Returns:
         Dictionary mapping "{dataset}_acc" (or _em/_f1) to scores
     """
-    # Multiple-choice datasets
+    # Multiple-choice datasets (DROP is now MC for speed)
     mc_datasets = ["boolq", "winogrande", "pubmedqa", "mmlu", "hellaswag", 
-                   "arc", "piqa", "aqua_rat", "casehold", "commonsenseqa"]
-    # Generative datasets
-    gen_datasets = ["drop", "squadv2"]
+                   "arc", "piqa", "casehold", "commonsenseqa", "drop"]
+    # Generative datasets (only squadv2 remains generative)
+    gen_datasets = ["squadv2"]
     
     if datasets is None:
         datasets = mc_datasets.copy()
@@ -1623,6 +1732,66 @@ def quick_eval_boolq_subprocess(
         batch_size=batch_size,
         device=device,
     )
+
+def load_aquarat(
+    max_examples: Optional[int] = None,
+    split: str = "test",
+) -> List[Dict]:
+    """
+    Load Aqua-RAT (math word problems) in multiple-choice form.
+
+    Uses the DeepMind raw config: deepmind/aqua_rat, config="raw"
+    Features: question (str), options (List[str]), rationale (str), correct (letter).
+    """
+    ds = load_dataset("deepmind/aqua_rat", "raw", split=split)
+    if max_examples is not None:
+        ds = ds.select(range(min(max_examples, len(ds))))
+
+    data: List[Dict] = []
+    for ex in ds:
+        options = ex["options"]
+        correct = ex["correct"].strip()
+        if not correct:
+            continue
+        # correct is "A"/"B"/...
+        answer_idx = ord(correct[0]) - ord("A")
+
+        data.append(
+            {
+                "question": ex["question"],
+                "options": options,
+                "answer": answer_idx,
+                "rationale": ex.get("rationale", ""),
+            }
+        )
+
+    return data
+
+def eval_aquarat(
+    model: PreTrainedModel,
+    tokenizer: PreTrainedTokenizerBase,
+    device: Union[torch.device, str] = "cuda",
+    batch_size: int = 4,
+    max_input_len: int = 512,
+    max_examples: Optional[int] = None,
+    split: str = "test",
+) -> Dict[str, float]:
+    """
+    Evaluate Aqua-RAT (deepmind/aqua_rat, raw config) as multiple-choice.
+
+    Returns {"aquarat_acc": float}.
+    """
+    data = load_aquarat(max_examples=max_examples, split=split)
+    evaluator_obj = MultipleChoiceEvaluator(
+        model=model,
+        tokenizer=tokenizer,
+        device=device,
+        batch_size=batch_size,
+        max_length=max_input_len,
+    )
+    result = evaluator_obj.evaluate("aquarat", data=data)
+    return {"aquarat_acc": result.accuracy}
+
 
 
 # =============================================================================

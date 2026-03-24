@@ -1,0 +1,18 @@
+{
+  "model": "meta-llama/Meta-Llama-3.1-8B",
+  "dataset": "fineweb-edu",
+  "split": "train",
+  "evaluation_params": {
+    "max_length": 2048,
+    "batch_size": 32,
+    "max_batches": 3,
+    "dtype": "bfloat16"
+  },
+  "results": {
+    "perplexity": 7.263856950212349,
+    "accuracy": 0.5520175247500787,
+    "total_tokens": 82626,
+    "num_batches": 3,
+    "avg_loss": 1.982910948127708
+  }
+}

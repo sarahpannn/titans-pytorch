@@ -1,3 +1,5 @@
+export CUDA_VISIBLE_DEVICES=1
+
 python3 speed_eval.py \
   --prompt-length 512 \
   --batch-size 1 \
@@ -6,5 +8,5 @@ python3 speed_eval.py \
   --nmm-chunk-size 64 \
   --warmup-steps 1 \
   --num-trials 5 \
-  --warmup-steps 3 \
+  --warmup-steps 2 \
   --save-dir speed_results
