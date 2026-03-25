@@ -48,6 +48,7 @@ class TitanLLaMAConfig:
         neural_mem_gate_attn_output: bool = True,
         neural_mem_weight_residual: bool = True,
         neural_mem_qkv_receives_diff_view: bool = True,
+        num_neural_mem_kv_tokens: int = 4,
         # Pretrained backbone support
         use_pretrained_backbone: bool = False,
         base_model_name_or_path: Optional[str] = None,
@@ -81,6 +82,7 @@ class TitanLLaMAConfig:
         self.neural_mem_gate_attn_output = neural_mem_gate_attn_output
         self.neural_mem_weight_residual = neural_mem_weight_residual
         self.neural_mem_qkv_receives_diff_view = neural_mem_qkv_receives_diff_view
+        self.num_neural_mem_kv_tokens = num_neural_mem_kv_tokens
         self.use_pretrained_backbone = use_pretrained_backbone
         self.base_model_name_or_path = base_model_name_or_path
         self.freeze_backbone = freeze_backbone
@@ -119,6 +121,7 @@ class TitanLLaMAConfig:
             'neural_mem_gate_attn_output',
             'neural_mem_weight_residual',
             'neural_mem_qkv_receives_diff_view',
+            'num_neural_mem_kv_tokens',
             'use_pretrained_backbone',
             'base_model_name_or_path',
             'freeze_backbone',
@@ -285,6 +288,7 @@ class TitanLLaMAAttention(nn.Module):
             use_flex_attn=config.use_flex_attn,
             pre_normed=True,  # TitanLLaMADecoderLayer applies input_layernorm before calling us
             rope_theta=config.rope_theta,
+            rope_freqs=getattr(config, '_rope_freqs', None),
         )
 
         # Check if this layer should have LoRA adapters
@@ -316,6 +320,7 @@ class TitanLLaMAAttention(nn.Module):
         use_cache: bool = False,
         cache_position: Optional[torch.LongTensor] = None,
         value_residual: Optional[torch.Tensor] = None,
+        memory_kv: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         **kwargs,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
 
@@ -323,7 +328,8 @@ class TitanLLaMAAttention(nn.Module):
         attn_output, attn_intermediates = self.segmented_attn(
             hidden_states,
             value_residual=value_residual,
-            cache=past_key_value
+            cache=past_key_value,
+            memory_kv=memory_kv,
         )
 
         # Extract attention weights if requested
@@ -389,6 +395,19 @@ class TitanLLaMADecoderLayer(nn.Module):
                 accept_weight_residual=False,
                 max_grad_norm=1.0,
             )
+
+            # Project retrieved memory → K,V in head space for attention prepend.
+            # Zero-initialized so memory KV starts as zero vectors (no effect at init,
+            # like persistent_memory's zero init). Attention softmax naturally ignores
+            # zero-key tokens, so pretrained behavior is preserved.
+            dim_inner = config.num_attention_heads * (config.hidden_size // config.num_attention_heads)
+            self.mem_to_kv = nn.Linear(config.hidden_size, 2 * dim_inner, bias=False)
+            nn.init.zeros_(self.mem_to_kv.weight)
+
+            self.num_neural_mem_kv_tokens = config.num_neural_mem_kv_tokens
+            self._num_heads = config.num_attention_heads
+            self._head_dim = config.hidden_size // config.num_attention_heads
+
             # Per-layer memory state (for TTT / long sequences)
             self.memory_state = None
 
@@ -407,7 +426,7 @@ class TitanLLaMADecoderLayer(nn.Module):
         residual = hidden_states
 
         # Neural Memory processing (before attention)
-        retrieved_memory = None
+        memory_kv = None
         new_weight_residual = None
         value_residual = kwargs.get('value_residual', None)
         prev_weight_residual = kwargs.get('prev_weight_residual', None)
@@ -430,17 +449,20 @@ class TitanLLaMADecoderLayer(nn.Module):
             )
 
             if not torch.isfinite(retrieved_memory).all():
-                # print(f"[NaN] retrieved_memory at layer {self.layer_idx}")
-                # optionally inspect state here
-                # for k, v in self.memory_state.weights.items():
-                #     print(k, torch.isfinite(v).all(), v.min().item(), v.max().item())
-                # raise RuntimeError
-                # print("WARNING: NANS FOUND BUT FORCE REWRITE FOR EVALS")
                 retrieved_memory = torch.zeros_like(hidden_states)
 
-            # If we're not gating, inject memory directly into the residual stream.
-            if not self.config.neural_mem_gate_attn_output and retrieved_memory is not None:
-                residual = residual + retrieved_memory
+            # Pool retrieved memory [B, T, D] → [B, M, D] via adaptive avg pool
+            M = self.num_neural_mem_kv_tokens
+            pooled = torch.nn.functional.adaptive_avg_pool1d(
+                retrieved_memory.transpose(1, 2), M
+            ).transpose(1, 2)  # [B, M, D]
+
+            # Project to K,V in head space (zero-init → no effect at start)
+            kv = self.mem_to_kv(pooled)  # [B, M, 2 * dim_inner]
+            mem_k, mem_v = kv.chunk(2, dim=-1)  # each [B, M, dim_inner]
+            mem_k = mem_k.reshape(-1, self._num_heads, M, self._head_dim)
+            mem_v = mem_v.reshape(-1, self._num_heads, M, self._head_dim)
+            memory_kv = (mem_k, mem_v)
 
         # ------------------------------------------------------------------
         # Self Attention
@@ -456,16 +478,8 @@ class TitanLLaMADecoderLayer(nn.Module):
             use_cache=use_cache,
             cache_position=cache_position,
             value_residual=value_residual,
+            memory_kv=memory_kv,
         )
-
-        # If configured, gate attention output by retrieved memory
-        if (
-            self.has_neural_memory
-            and self.config.neural_mem_gate_attn_output
-            and retrieved_memory is not None
-        ):
-            gate = retrieved_memory.sigmoid()
-            hidden_states = hidden_states * gate
 
         # Standard residual after attention
         hidden_states = residual + hidden_states
@@ -822,11 +836,19 @@ class TitanLLaMAForCausalLM(nn.Module):
 
 
     @staticmethod
-    def _repeat_kv_weights(weight: torch.Tensor, repeat_factor: int) -> torch.Tensor:
-        """Repeat kv projection weights for grouped query attention backbones."""
+    def _repeat_kv_weights(weight: torch.Tensor, repeat_factor: int, head_dim: int = 64) -> torch.Tensor:
+        """Repeat kv projection weights for grouped query attention backbones.
+
+        Weight shape is (kv_heads * head_dim, hidden_size).  We need to repeat
+        at the HEAD level so that Q heads 0..3 share KV head 0, etc.
+        """
         if repeat_factor == 1:
             return weight
-        return weight.repeat_interleave(repeat_factor, dim=0)
+        out_dim, hidden = weight.shape
+        kv_heads = out_dim // head_dim
+        weight = weight.view(kv_heads, head_dim, hidden)
+        weight = weight.repeat_interleave(repeat_factor, dim=0)
+        return weight.reshape(kv_heads * repeat_factor * head_dim, hidden)
 
     @classmethod
     def from_pretrained(
@@ -881,6 +903,7 @@ class TitanLLaMAForCausalLM(nn.Module):
             neural_mem_gate_attn_output=_get("neural_mem_gate_attn_output", False),
             neural_mem_weight_residual=_get("neural_mem_weight_residual", True),
             neural_mem_qkv_receives_diff_view=_get("neural_mem_qkv_receives_diff_view", True),
+            num_neural_mem_kv_tokens=_get("num_neural_mem_kv_tokens", 4),
             use_pretrained_backbone=False,
             base_model_name_or_path=base_model_name_or_path,
             freeze_backbone=True,
@@ -933,6 +956,7 @@ class TitanLLaMAForCausalLM(nn.Module):
                 "neural_mem_gate_attn_output": titan_config.neural_mem_gate_attn_output,
                 "neural_mem_weight_residual": titan_config.neural_mem_weight_residual,
                 "neural_mem_qkv_receives_diff_view": titan_config.neural_mem_qkv_receives_diff_view,
+                "num_neural_mem_kv_tokens": titan_config.num_neural_mem_kv_tokens,
                 # LoRA config
                 "use_lora": titan_config.use_lora,
                 "lora_rank": titan_config.lora_rank,
@@ -967,6 +991,13 @@ class TitanLLaMAForCausalLM(nn.Module):
             device_map="cuda",
             **from_pretrained_kwargs,
         )
+
+        # Extract the teacher's RoPE frequencies (accounts for LLaMA3 rope_scaling).
+        # Store on config so SegmentedAttention uses them instead of recomputing.
+        if hasattr(base_model.model, 'rotary_emb') and hasattr(base_model.model.rotary_emb, 'inv_freq'):
+            titan_cfg._rope_freqs = base_model.model.rotary_emb.inv_freq.float().clone()
+        else:
+            titan_cfg._rope_freqs = None
 
         model = cls(titan_cfg)
         model.to(dtype=dtype, device='cuda')
@@ -1003,6 +1034,7 @@ class TitanLLaMAForCausalLM(nn.Module):
             self.model.norm.weight.copy_(llama_model.model.norm.weight)
 
             num_kv_groups = max(1, self.config.num_attention_heads // self.config.num_key_value_heads)
+            head_dim = self.config.hidden_size // self.config.num_attention_heads
 
             # Per-layer weights
             for titan_layer, llama_layer in zip(self.model.layers, llama_layers):
@@ -1012,8 +1044,8 @@ class TitanLLaMAForCausalLM(nn.Module):
 
                 # Attention projections
                 q_weight = llama_layer.self_attn.q_proj.weight
-                k_weight = self._repeat_kv_weights(llama_layer.self_attn.k_proj.weight, num_kv_groups)
-                v_weight = self._repeat_kv_weights(llama_layer.self_attn.v_proj.weight, num_kv_groups)
+                k_weight = self._repeat_kv_weights(llama_layer.self_attn.k_proj.weight, num_kv_groups, head_dim)
+                v_weight = self._repeat_kv_weights(llama_layer.self_attn.v_proj.weight, num_kv_groups, head_dim)
                 to_qkv = torch.cat([q_weight, k_weight, v_weight], dim=0)
 
                 # Handle LoRA-wrapped projections
@@ -1071,8 +1103,8 @@ class TitanLLaMAForCausalLM(nn.Module):
                 param.requires_grad = True
                 continue
 
-            # Neural memory: ALL params trainable (MLP model + write-side + read-side)
-            if "neural_memory" in name:
+            # Neural memory: ALL params trainable (MLP model + write-side + read-side + KV projection)
+            if "neural_memory" in name or "mem_to_kv" in name:
                 param.requires_grad = True
                 nm_total += param.numel()
                 continue

@@ -59,6 +59,37 @@ from einops.layers.torch import Rearrange
 from axial_positional_embedding import ContinuousAxialPositionalEmbedding
 from rotary_embedding_torch import RotaryEmbedding
 
+# HF-compatible split-half RoPE (matches LLaMA's convention)
+
+def _rotate_half_hf(x):
+    """Split-half rotation: pairs (dim_i, dim_{i+d/2})."""
+    x1 = x[..., : x.shape[-1] // 2]
+    x2 = x[..., x.shape[-1] // 2 :]
+    return torch.cat((-x2, x1), dim=-1)
+
+def apply_rotary_pos_emb_hf(q, k, inv_freq):
+    """Apply RoPE using HF LLaMA's split-half convention.
+
+    Args:
+        q: (batch, heads, seq_len, dim_head)
+        k: (batch, heads, seq_len, dim_head)
+        inv_freq: (dim_head // 2,) — the teacher's precomputed inverse frequencies
+    Returns:
+        rotated (q, k) with same shapes
+    """
+    seq_len = k.shape[-2]
+    positions = torch.arange(seq_len, device=q.device, dtype=inv_freq.dtype)
+    freqs = torch.outer(positions, inv_freq)           # (seq_len, dim/2)
+    emb = torch.cat((freqs, freqs), dim=-1)            # (seq_len, dim)
+    cos = emb.cos().to(q.dtype)
+    sin = emb.sin().to(q.dtype)
+    # broadcast: (1, 1, seq_len, dim)
+    cos = cos.unsqueeze(0).unsqueeze(0)
+    sin = sin.unsqueeze(0).unsqueeze(0)
+    q_rot = (q * cos) + (_rotate_half_hf(q) * sin)
+    k_rot = (k * cos) + (_rotate_half_hf(k) * sin)
+    return q_rot, k_rot
+
 # hyper connections / attend from x-transformers, which handles different queries and key lengths better
 
 from x_transformers.attend import Attend
@@ -193,6 +224,7 @@ class SegmentedAttention(Module):
         use_flex_attn = False,
         pre_normed = False,
         rope_theta = 10000,
+        rope_freqs = None,
     ):
         super().__init__()
         self.pre_normed = pre_normed
@@ -200,7 +232,16 @@ class SegmentedAttention(Module):
 
         dim_inner = dim_head * heads
 
-        self.rotary_emb = RotaryEmbedding(dim_head, theta=rope_theta)
+        # When rope_freqs are provided (from a pretrained HF model), use
+        # the split-half RoPE convention that HF LLaMA was trained with.
+        # rotary_embedding_torch uses interleaved rotation which is incompatible.
+        self._use_hf_rope = rope_freqs is not None
+        if self._use_hf_rope:
+            self.register_buffer('_rope_inv_freq', rope_freqs.float().clone(), persistent=False)
+            # Still create rotary_emb for API compat but it won't be used
+            self.rotary_emb = RotaryEmbedding(dim_head, theta=rope_theta)
+        else:
+            self.rotary_emb = RotaryEmbedding(dim_head, theta=rope_theta)
 
         self.attend = Attend(causal = True, **attend_kwargs)
 
@@ -240,6 +281,7 @@ class SegmentedAttention(Module):
         cache,
         value_residual = None,
         output_gating = None,
+        memory_kv = None,
     ):
         batch = token.shape[0]
 
@@ -269,7 +311,10 @@ class SegmentedAttention(Module):
 
         # relative positions
 
-        q, k = self.rotary_emb.rotate_queries_with_cached_keys(q, k)
+        if self._use_hf_rope:
+            q, k = apply_rotary_pos_emb_hf(q, k, self._rope_inv_freq)
+        else:
+            q, k = self.rotary_emb.rotate_queries_with_cached_keys(q, k)
 
         # fold
 
@@ -279,10 +324,17 @@ class SegmentedAttention(Module):
 
         pmk, pmv = repeat(self.persistent_memory, 'kv ... -> kv b ...', b = k.shape[0])
 
-        # persistent memory
+        # prepend neural memory kv + persistent memory
 
-        k = cat((pmk, k), dim = -2)
-        v = cat((pmv, v), dim = -2)
+        prefix_k = [pmk]
+        prefix_v = [pmv]
+        if exists(memory_kv):
+            mem_k, mem_v = memory_kv
+            prefix_k.insert(0, mem_k)
+            prefix_v.insert(0, mem_v)
+
+        k = cat((*prefix_k, k), dim = -2)
+        v = cat((*prefix_v, v), dim = -2)
 
         # attention
 
@@ -303,7 +355,8 @@ class SegmentedAttention(Module):
         value_residual = None,
         flex_attn_fn: Callable | None = None,
         output_gating = None,
-        cache = None
+        cache = None,
+        memory_kv = None,
     ):
 
         assert not (exists(value_residual) ^ exists(self.to_learned_v_mix))
@@ -336,17 +389,30 @@ class SegmentedAttention(Module):
 
         # relative positions
 
-        q, k = self.rotary_emb.rotate_queries_with_cached_keys(q, k)
+        if self._use_hf_rope:
+            q, k = apply_rotary_pos_emb_hf(q, k, self._rope_inv_freq)
+        else:
+            q, k = self.rotary_emb.rotate_queries_with_cached_keys(q, k)
 
-        # persistent memory
+        # prepend neural memory kv + persistent memory
 
-        k = cat((pmk, k), dim = -2)
-        v = cat((pmv, v), dim = -2)
+        num_mem_kv = memory_kv[0].shape[-2] if exists(memory_kv) else 0
+        total_prefix = self.num_persist_mem_tokens + num_mem_kv
+
+        prefix_k = [pmk]
+        prefix_v = [pmv]
+        if exists(memory_kv):
+            mem_k, mem_v = memory_kv
+            prefix_k.insert(0, mem_k)
+            prefix_v.insert(0, mem_v)
+
+        k = cat((*prefix_k, k), dim = -2)
+        v = cat((*prefix_v, v), dim = -2)
 
         # prep flex attention
 
         if not exists(flex_attn_fn):
-            block_mask = create_mac_block_mask(seq_len, self.total_segment_len, self.num_persist_mem_tokens, self.sliding)
+            block_mask = create_mac_block_mask(seq_len, self.total_segment_len, total_prefix, self.sliding)
 
             flex_attn_fn = partial(flex_attention, block_mask = block_mask)
 
@@ -370,16 +436,17 @@ class SegmentedAttention(Module):
         flex_attn_fn: Callable | None = None,
         disable_flex_attn = False,
         output_gating = None,
-        cache = None
+        cache = None,
+        memory_kv = None,
     ):
         is_inferencing = exists(cache)
 
         if is_inferencing:
             assert seq.shape[-2] == 1
-            return self.forward_inference(seq, cache, value_residual, output_gating = output_gating)
+            return self.forward_inference(seq, cache, value_residual, output_gating = output_gating, memory_kv = memory_kv)
 
         if seq.is_cuda and self.use_flex_attn and not disable_flex_attn:
-            return self.forward_flex(seq, value_residual, flex_attn_fn, output_gating = output_gating, cache = cache)
+            return self.forward_flex(seq, value_residual, flex_attn_fn, output_gating = output_gating, cache = cache, memory_kv = memory_kv)
 
         assert not (exists(value_residual) ^ exists(self.to_learned_v_mix))
 
@@ -414,11 +481,19 @@ class SegmentedAttention(Module):
 
         # relative positions
 
-        q, k = self.rotary_emb.rotate_queries_with_cached_keys(q, k)
+        if self._use_hf_rope:
+            q, k = apply_rotary_pos_emb_hf(q, k, self._rope_inv_freq)
+        else:
+            q, k = self.rotary_emb.rotate_queries_with_cached_keys(q, k)
 
         # fold
 
         q, k, v = tuple(rearrange(t, 'b h (w n) d -> (b w) h n d', n = total_segment_len) for t in (q, k, v))
+
+        # determine total prefix length (neural mem kv + persistent mem)
+
+        num_mem_kv = memory_kv[0].shape[-2] if exists(memory_kv) else 0
+        total_prefix = self.num_persist_mem_tokens + num_mem_kv
 
         # maybe sliding for cpu
 
@@ -442,7 +517,7 @@ class SegmentedAttention(Module):
             k_idx = rearrange(k_idx, 'w j -> w 1 j')
 
             sliding_mask = (q_idx - k_idx) <= total_segment_len
-            sliding_mask = F.pad(sliding_mask, (self.num_persist_mem_tokens, 0), value = True)
+            sliding_mask = F.pad(sliding_mask, (total_prefix, 0), value = True)
 
             sliding_mask = repeat(sliding_mask, 'w i j -> (b w) 1 i j', b = batch)
             attend_kwargs.update(mask = sliding_mask)
@@ -451,10 +526,21 @@ class SegmentedAttention(Module):
 
         pmk, pmv = repeat(self.persistent_memory, 'kv ... -> kv b ...', b = k.shape[0])
 
-        # persistent memory
+        # prepend neural memory kv + persistent memory
 
-        k = cat((pmk, k), dim = -2)
-        v = cat((pmv, v), dim = -2)
+        prefix_k = [pmk]
+        prefix_v = [pmv]
+        if exists(memory_kv):
+            mem_k, mem_v = memory_kv
+            # Repeat across windows: (b, h, m, d) -> (b*w, h, m, d)
+            num_windows = q.shape[0] // batch
+            mem_k = repeat(mem_k, 'b h m d -> (b w) h m d', w = num_windows)
+            mem_v = repeat(mem_v, 'b h m d -> (b w) h m d', w = num_windows)
+            prefix_k.insert(0, mem_k)
+            prefix_v.insert(0, mem_v)
+
+        k = cat((*prefix_k, k), dim = -2)
+        v = cat((*prefix_v, v), dim = -2)
 
         # attention
 

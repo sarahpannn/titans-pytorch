@@ -161,6 +161,7 @@ class TrainingConfig:
     sliding_window_attn: bool = False
     neural_mem_gate_attn_output: bool = False
     neural_mem_weight_residual: bool = True
+    num_neural_mem_kv_tokens: int = 4
     
     # Training configuration
     total_tokens: int = 1_000_000_000  # 1B tokens
@@ -289,6 +290,7 @@ def create_model_and_optimizer(config: TrainingConfig, device):
         sliding_window_attn=config.sliding_window_attn,
         neural_mem_gate_attn_output=config.neural_mem_gate_attn_output,
         neural_mem_weight_residual=config.neural_mem_weight_residual,
+        num_neural_mem_kv_tokens=config.num_neural_mem_kv_tokens,
         use_pretrained_backbone=config.use_pretrained_backbone,
         base_model_name_or_path=config.base_model_name,
         freeze_backbone=config.freeze_backbone,
@@ -366,7 +368,7 @@ def create_model_and_optimizer(config: TrainingConfig, device):
         for name, param in model.named_parameters():
             if not param.requires_grad:
                 continue
-            if 'neural_memory' in name:
+            if 'neural_memory' in name or 'mem_to_kv' in name:
                 neural_memory_params.append(param)
             elif '.lora.' in name or '.lora_' in name:
                 lora_params.append(param)
@@ -810,6 +812,10 @@ def main(config=None):
 
             # print("TRAIN SIZE: ", input_ids.shape)
             
+            # Reset memory states before each independent sequence to prevent
+            # cross-sequence contamination in neural memory retrieval.
+            model.reset_memory_states()
+
             # Forward pass
             outputs = model(input_ids=input_ids, labels=labels, output_hidden_states=True)
             lm_loss = outputs['loss'] / config.gradient_accumulation_steps
@@ -858,10 +864,6 @@ def main(config=None):
         #     log_cuda_mem("after optimizer.step")
         #     print("[CUDA] peak allocated:", torch.cuda.max_memory_allocated()/1024**3, "GiB")
         #     break
-        
-        # Reset memory states periodically to prevent memory leaks
-        if step % 10 == 0:
-            model.reset_memory_states()
         
         # Logging
         running_loss += epoch_loss
