@@ -25,16 +25,9 @@ class LayerNorm(Module):
     def forward(self, x):
         gamma = self.gamma
 
-        # if gamma.ndim == 2:
-        #     gamma = rearrange(gamma, 'b d -> b 1 d')
-        
-        # # bhd,hdf->bhf
-        # if gamma.ndim == 3:
-        #     gamma = rearrange(gamma, 'h 1 d -> 1 h d')
+        if gamma.ndim == 2:
+            gamma = gamma.unsqueeze(1)
 
-        while gamma.ndim > 1: gamma = gamma.mean(dim=0)
-
-        # print(x.shape, gamma.shape)
         return self.ln(x) * (gamma + 1.)
 
 # norm + residual wrapper, as used in original TTT paper
@@ -102,29 +95,16 @@ class MemoryMLP(Module):
     def forward(
         self,
         x
-    ):  
-
-        orig_shape = x.shape
-        d = orig_shape[-1]
-
-        batch_dim = x.numel() // d
-        x = x.reshape(batch_dim, d)
-
+    ):
         for ind, weight in enumerate(self.weights):
-            is_first = ind == 0
-
-            if not is_first:
+            if ind > 0:
                 x = F.gelu(x)
 
-            w = weight
+            if weight.ndim == 3 and x.ndim == 3:
+                x = torch.bmm(x, weight)
+            else:
+                x = x @ weight
 
-            if w.ndim == 3:
-                w = w.mean(dim=0)
-
-            # x = self._apply_memory_linear(x, weight)
-            x = x @ w
-
-        x = x.reshape(*orig_shape[:-1], x.shape[-1])
         return x
 
 # memory mlp, but with gated residual + final projection

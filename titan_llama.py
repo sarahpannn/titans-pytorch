@@ -284,6 +284,7 @@ class TitanLLaMAAttention(nn.Module):
             accept_value_residual=layer_idx > 0,  # First layer doesn't get value residual
             use_flex_attn=config.use_flex_attn,
             pre_normed=True,  # TitanLLaMADecoderLayer applies input_layernorm before calling us
+            rope_theta=config.rope_theta,
         )
 
         # Check if this layer should have LoRA adapters

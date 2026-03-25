@@ -15,17 +15,16 @@ python3 run_training.py \
     --segment_len 512 \
     --sequence_length 1024 \
     --batch_size 64 \
-    --micro_batch_size 8 \
+    --micro_batch_size 1 \
     --num_persist_mem 0 \
-    --num_longterm_mem 4 \
-    --neural_memory_layers "3,7,11,15" \
-    --distillation_layers "3,4,7,8,11,12,15,16" \
+    --num_longterm_mem 2 \
+    --neural_memory_layers "3,7,11" \
     --neural_memory_segment_len 64 \
     --neural_memory_batch_size 64 \
     --total_tokens 10000000 \
-    --learning_rate 3e-4 \
+    --learning_rate 1e-3 \
     --min_learning_rate 5e-6 \
-    --neural_mem_lr 1e-2 \
+    --neural_mem_lr 1e-4 \
     --warmup_steps 2000 \
     --eval_interval 1000 \
     --save_interval 5000 \
@@ -38,9 +37,7 @@ python3 run_training.py \
     --lora_alpha 16 \
     --lora_dropout 0.0 \
     --lora_layers_after_memory 1 \
-    --use_attention_distillation \
-    --distillation_weight 0.3 \
-    --lora_lr 1e-4 \
+    --lora_lr 2e-4 \
     --output_dir "./titan_llama_lora_slimpajama" \
     --wandb_project "titan-llama-lora" \
     --wandb_run_name "lora-slimpajama-llama3.2-1b"

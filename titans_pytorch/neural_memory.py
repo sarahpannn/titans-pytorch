@@ -997,19 +997,14 @@ class NeuralMemory(Module):
         updates = None
 
         def accum_updates(past_updates, future_updates):
-            # if not exists(past_updates):
-            #     return future_updates
+            if not exists(past_updates):
+                return future_updates
             if not exists(future_updates):
                 return past_updates
 
             return TensorDict({
-                name: upd[:, -1:].contiguous()
-                for name, upd in future_updates.items()
-            })
-
-            # return TensorDict({
-            #     param_name: cat((past_update[:, :-1], future_update), dim = 1) 
-            #     for (param_name, past_update), (_, future_update) in zip(past_updates.items(), future_updates.items())})
+                param_name: cat((past_update[:, :-1], future_update), dim = 1)
+                for (param_name, past_update), (_, future_update) in zip(past_updates.items(), future_updates.items())})
 
         # loop through chunks of store sequences
 

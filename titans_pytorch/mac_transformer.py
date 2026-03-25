@@ -192,6 +192,7 @@ class SegmentedAttention(Module):
         attend_kwargs: dict = dict(),
         use_flex_attn = False,
         pre_normed = False,
+        rope_theta = 10000,
     ):
         super().__init__()
         self.pre_normed = pre_normed
@@ -199,7 +200,7 @@ class SegmentedAttention(Module):
 
         dim_inner = dim_head * heads
 
-        self.rotary_emb = RotaryEmbedding(dim_head)
+        self.rotary_emb = RotaryEmbedding(dim_head, theta=rope_theta)
 
         self.attend = Attend(causal = True, **attend_kwargs)
 
