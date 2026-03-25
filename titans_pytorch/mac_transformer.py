@@ -190,9 +190,11 @@ class SegmentedAttention(Module):
         sliding = False,
         accept_value_residual = False,
         attend_kwargs: dict = dict(),
-        use_flex_attn = False
+        use_flex_attn = False,
+        pre_normed = False,
     ):
         super().__init__()
+        self.pre_normed = pre_normed
         self.norm = nn.RMSNorm(dim)
 
         dim_inner = dim_head * heads
@@ -242,7 +244,8 @@ class SegmentedAttention(Module):
 
         # attention
 
-        token = self.norm(token)
+        if not self.pre_normed:
+            token = self.norm(token)
 
         q, k, v = self.to_qkv(token).chunk(3, dim = -1)
         q, k, v = map(self.split_heads, (q, k, v))
@@ -308,7 +311,8 @@ class SegmentedAttention(Module):
 
         # attention
 
-        seq = self.norm(seq)
+        if not self.pre_normed:
+            seq = self.norm(seq)
 
         q, k, v = self.to_qkv(seq).chunk(3, dim = -1)
         q, k, v = map(self.split_heads, (q, k, v))
@@ -389,7 +393,8 @@ class SegmentedAttention(Module):
 
         # attention
 
-        seq = self.norm(seq)
+        if not self.pre_normed:
+            seq = self.norm(seq)
 
         q, k, v = self.to_qkv(seq).chunk(3, dim = -1)
         q, k, v = map(self.split_heads, (q, k, v))

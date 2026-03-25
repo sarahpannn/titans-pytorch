@@ -282,7 +282,8 @@ class TitanLLaMAAttention(nn.Module):
             heads=self.num_heads,
             sliding=config.sliding_window_attn,
             accept_value_residual=layer_idx > 0,  # First layer doesn't get value residual
-            use_flex_attn=config.use_flex_attn
+            use_flex_attn=config.use_flex_attn,
+            pre_normed=True,  # TitanLLaMADecoderLayer applies input_layernorm before calling us
         )
 
         # Check if this layer should have LoRA adapters
@@ -443,7 +444,7 @@ class TitanLLaMADecoderLayer(nn.Module):
         # ------------------------------------------------------------------
         # Self Attention
         # ------------------------------------------------------------------
-        # hidden_states = self.input_layernorm(hidden_states)
+        hidden_states = self.input_layernorm(hidden_states)
 
         hidden_states, self_attn_weights, present_key_value, new_value_residual = self.self_attn(
             hidden_states=hidden_states,
@@ -1026,6 +1027,13 @@ class TitanLLaMAForCausalLM(nn.Module):
                 else:
                     out_layer.weight.copy_(llama_layer.self_attn.o_proj.weight)
 
+                # Initialize value residual mix to zero (no mixing) so we start
+                # equivalent to the teacher.  sigmoid(-10) ≈ 0 → v.lerp(vr, 0) = v.
+                v_mix = titan_layer.self_attn.segmented_attn.to_learned_v_mix
+                if v_mix is not None:
+                    nn.init.zeros_(v_mix[0].weight)
+                    nn.init.constant_(v_mix[0].bias, -10.0)
+
                 # MLP
                 titan_layer.mlp.gate_proj.weight.copy_(llama_layer.mlp.gate_proj.weight)
                 titan_layer.mlp.up_proj.weight.copy_(llama_layer.mlp.up_proj.weight)
@@ -1055,6 +1063,11 @@ class TitanLLaMAForCausalLM(nn.Module):
             if ".lora." in name or ".lora_" in name:
                 param.requires_grad = True
                 lora_total += param.numel()
+                continue
+
+            # Value residual mixing parameters trainable
+            if "to_learned_v_mix" in name:
+                param.requires_grad = True
                 continue
 
             # Neural memory: ALL params trainable (MLP model + write-side + read-side)
