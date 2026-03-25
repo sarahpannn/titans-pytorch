@@ -698,6 +698,11 @@ class NeuralMemory(Module):
 
         grads = TensorDict(grads)
 
+        # Detach per-sample gradients to avoid second-order backprop through vmap(grad(...))
+        # while keeping momentum/decay/modulation paths differentiable for outer LM loss
+        grads = grads.apply(lambda t: t.detach())
+        unweighted_mem_model_loss = unweighted_mem_model_loss.detach()
+
         # surprises
 
         adaptive_lr = rearrange(adaptive_lr, '(b h n) c -> b h (n c)', b = batch, h = heads)
@@ -1023,46 +1028,45 @@ class NeuralMemory(Module):
         if exists(self.transition_gate):
             gate = self.transition_gate.sigmoid()
 
-        with torch.no_grad():
-            for ind, (store_seq_chunk, maybe_store_mask) in enumerate(zip(store_seqs, store_masks)):
-                is_last = ind == (len(store_seqs) - 1)
+        for ind, (store_seq_chunk, maybe_store_mask) in enumerate(zip(store_seqs, store_masks)):
+            is_last = ind == (len(store_seqs) - 1)
 
-                next_updates, next_neural_mem_state, chunk_surprises = self.store_memories(
-                    store_seq_chunk,
-                    weights,
-                    seq_index=seq_index,
-                    past_state=past_state,
-                    prev_weights=prev_weights,
-                    mask=maybe_store_mask,
-                    return_surprises=True,
-                )
+            next_updates, next_neural_mem_state, chunk_surprises = self.store_memories(
+                store_seq_chunk,
+                weights,
+                seq_index=seq_index,
+                past_state=past_state,
+                prev_weights=prev_weights,
+                mask=maybe_store_mask,
+                return_surprises=True,
+            )
 
-                weights = next_neural_mem_state.weights
-                seq_index = next_neural_mem_state.seq_index
-                past_state = next_neural_mem_state.states
+            weights = next_neural_mem_state.weights
+            seq_index = next_neural_mem_state.seq_index
+            past_state = next_neural_mem_state.states
 
-                updates = accum_updates(updates, next_updates)
-                surprises = tuple(safe_cat(args, dim=-1) for args in zip(surprises, chunk_surprises))
+            updates = accum_updates(updates, next_updates)
+            surprises = tuple(safe_cat(args, dim=-1) for args in zip(surprises, chunk_surprises))
 
-                if is_last and not update_after_final_store:
-                    continue
+            if is_last and not update_after_final_store:
+                continue
 
-                last_update, last_momentum = past_state
+            last_update, last_momentum = past_state
 
-                if exists(gate):
-                    last_update = TensorDict({
-                        param_name: one_weight.lerp(one_last_update, gate)
-                        for (param_name, one_weight), (_, one_last_update)
-                        in zip(weights.items(), last_update.items())
-                    })
+            if exists(gate):
+                last_update = TensorDict({
+                    param_name: one_weight.lerp(one_last_update, gate)
+                    for (param_name, one_weight), (_, one_last_update)
+                    in zip(weights.items(), last_update.items())
+                })
 
-                past_state = (last_update, last_momentum)
-                weights = last_update
+            past_state = (last_update, last_momentum)
+            weights = last_update
 
-                next_neural_mem_state = next_neural_mem_state._replace(
-                    weights=weights,
-                    states=past_state,
-                )
+            next_neural_mem_state = next_neural_mem_state._replace(
+                weights=weights,
+                states=past_state,
+            )
 
         if is_single_token:
             last_update, _ = next_neural_mem_state.states

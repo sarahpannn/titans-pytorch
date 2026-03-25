@@ -424,6 +424,7 @@ class TitanLLaMADecoderLayer(nn.Module):
                 memory_input,
                 state=self.memory_state,
                 prev_weights=None,
+                detach_mem_state=True,
             )
 
             if not torch.isfinite(retrieved_memory).all():
@@ -442,7 +443,7 @@ class TitanLLaMADecoderLayer(nn.Module):
         # ------------------------------------------------------------------
         # Self Attention
         # ------------------------------------------------------------------
-        hidden_states = self.input_layernorm(hidden_states)
+        # hidden_states = self.input_layernorm(hidden_states)
 
         hidden_states, self_attn_weights, present_key_value, new_value_residual = self.self_attn(
             hidden_states=hidden_states,
@@ -1034,24 +1035,12 @@ class TitanLLaMAForCausalLM(nn.Module):
         """
         Freeze pretrained backbone weights.
         Keep trainable:
-        - NeuralMemory read-side adapters (to_queries, retrieve_gate, etc.)
+        - ALL NeuralMemory parameters (MLP model, write-side, read-side)
         - LoRA adapters on attention projections (lora_A, lora_B)
         - Persistent memory tokens
         """
 
-        keys_to_freeze = [
-            "memory_model_parameters",   # inner MLP weights
-            ".to_keys",                  # write-side projections
-            ".to_values",
-            ".to_adaptive_step",
-            ".to_momentum",
-            ".to_decay_factor",
-            ".to_layer_modulation",
-            ".to_learned_weight_residual_mix",
-        ]
-
         nm_total = 0
-        nm_frozen = 0
         lora_total = 0
 
         print("\n[freeze_backbone] ***** BEGIN *****")
@@ -1068,22 +1057,15 @@ class TitanLLaMAForCausalLM(nn.Module):
                 lora_total += param.numel()
                 continue
 
-            # Neural memory handling
+            # Neural memory: ALL params trainable (MLP model + write-side + read-side)
             if "neural_memory" in name:
+                param.requires_grad = True
                 nm_total += param.numel()
-
-                if any(k in name for k in keys_to_freeze):
-                    param.requires_grad = False
-                    nm_frozen += param.numel()
-                else:
-                    param.requires_grad = True
                 continue
 
             # Everything else = backbone → frozen
             param.requires_grad = False
 
-        print(f"[freeze_backbone] NM total params:  {nm_total:,}")
-        print(f"[freeze_backbone] NM frozen params: {nm_frozen:,}")
-        print(f"[freeze_backbone] NM trainable:     {nm_total - nm_frozen:,}")
+        print(f"[freeze_backbone] NM trainable:     {nm_total:,}")
         print(f"[freeze_backbone] LoRA trainable:   {lora_total:,}")
         print("[freeze_backbone] ***** END *****\n")
