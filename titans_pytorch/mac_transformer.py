@@ -285,8 +285,6 @@ class SegmentedAttention(Module):
     ):
         batch = token.shape[0]
 
-        # attention
-
         if not self.pre_normed:
             token = self.norm(token)
 
@@ -301,28 +299,36 @@ class SegmentedAttention(Module):
             mix = self.to_learned_v_mix(token)
             v = v.lerp(value_residual, mix)
 
-        # caching
+        # RoPE + caching
 
         ck, cv = cache
-        k = cat((ck, k), dim = -2)
-        v = cat((cv, v), dim = -2)
+        cache_len = ck.shape[-2]
+
+        if self._use_hf_rope:
+            # Cache stores pre-rotated keys — only rotate the new token
+            pos = torch.tensor([cache_len], device=q.device, dtype=self._rope_inv_freq.dtype)
+            freqs = torch.outer(pos, self._rope_inv_freq)
+            emb = cat((freqs, freqs), dim=-1)
+            cos = emb.cos().to(q.dtype).view(1, 1, 1, -1)
+            sin = emb.sin().to(q.dtype).view(1, 1, 1, -1)
+            q = (q * cos) + (_rotate_half_hf(q) * sin)
+            k = (k * cos) + (_rotate_half_hf(k) * sin)
+        else:
+            # Cache stores unrotated keys — rotate everything (original behaviour)
+            k = cat((ck, k), dim = -2)
+            v = cat((cv, v), dim = -2)
+            q, k = self.rotary_emb.rotate_queries_with_cached_keys(q, k)
+            ck, cv = None, None          # already concatenated
+
+        if exists(ck):
+            k = cat((ck, k), dim = -2)
+            v = cat((cv, v), dim = -2)
 
         next_cache = (k, v)
 
-        # relative positions
-
-        if self._use_hf_rope:
-            q, k = apply_rotary_pos_emb_hf(q, k, self._rope_inv_freq)
-        else:
-            q, k = self.rotary_emb.rotate_queries_with_cached_keys(q, k)
-
-        # fold
-
-        q, k, v = tuple(rearrange(t, 'b h n d -> b h n d') for t in (q, k, v))
-
         # take care of persistent memory key / values
 
-        pmk, pmv = repeat(self.persistent_memory, 'kv ... -> kv b ...', b = k.shape[0])
+        pmk, pmv = repeat(self.persistent_memory, 'kv ... -> kv b ...', b = batch)
 
         # prepend neural memory kv + persistent memory
 
@@ -336,9 +342,9 @@ class SegmentedAttention(Module):
         k = cat((*prefix_k, k), dim = -2)
         v = cat((*prefix_v, v), dim = -2)
 
-        # attention
+        # scaled dot-product attention (single query token → no causal mask needed)
 
-        out, _ = self.attend(q, k, v)
+        out = F.scaled_dot_product_attention(q, k, v)
 
         out = self.merge_heads(out)
 
@@ -379,20 +385,18 @@ class SegmentedAttention(Module):
             mix = self.to_learned_v_mix(seq)
             v = v.lerp(value_residual, mix)
 
-        # caching
+        # relative positions and caching (same order change as forward())
 
-        next_cache = (k, v)
+        if self._use_hf_rope:
+            q, k = apply_rotary_pos_emb_hf(q, k, self._rope_inv_freq)
+            next_cache = (k, v)
+        else:
+            next_cache = (k, v)
+            q, k = self.rotary_emb.rotate_queries_with_cached_keys(q, k)
 
         # take care of persistent memory key / values
 
         pmk, pmv = repeat(self.persistent_memory, 'kv h n d -> kv b h n d', b = batch)
-
-        # relative positions
-
-        if self._use_hf_rope:
-            q, k = apply_rotary_pos_emb_hf(q, k, self._rope_inv_freq)
-        else:
-            q, k = self.rotary_emb.rotate_queries_with_cached_keys(q, k)
 
         # prepend neural memory kv + persistent memory
 
@@ -439,10 +443,9 @@ class SegmentedAttention(Module):
         cache = None,
         memory_kv = None,
     ):
-        is_inferencing = exists(cache)
+        is_inferencing = exists(cache) and seq.shape[-2] == 1
 
         if is_inferencing:
-            assert seq.shape[-2] == 1
             return self.forward_inference(seq, cache, value_residual, output_gating = output_gating, memory_kv = memory_kv)
 
         if seq.is_cuda and self.use_flex_attn and not disable_flex_attn:
@@ -475,15 +478,15 @@ class SegmentedAttention(Module):
             mix = self.to_learned_v_mix(seq)
             v = v.lerp(value_residual, mix)
 
-        # caching
-
-        next_cache = tuple(map(inverse_segment, (k, v)))
-
-        # relative positions
+        # relative positions and caching
+        # HF rope: rotate before caching so cache stores pre-rotated keys
+        # (avoids O(n^2) re-rotation of full cache during inference)
 
         if self._use_hf_rope:
             q, k = apply_rotary_pos_emb_hf(q, k, self._rope_inv_freq)
+            next_cache = (inverse_segment(k), inverse_segment(v))
         else:
+            next_cache = tuple(map(inverse_segment, (k, v)))
             q, k = self.rotary_emb.rotate_queries_with_cached_keys(q, k)
 
         # fold

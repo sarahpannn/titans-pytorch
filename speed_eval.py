@@ -15,7 +15,7 @@ import math
 import os
 import shutil
 import time
-from typing import Callable, Dict, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import torch
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
@@ -44,6 +44,20 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto", help="Force device selection.")
     p.add_argument("--cleanup-cache", action="store_true", help="Delete the HF cache entries for the tested model after benchmarking.")
     p.add_argument("--save-dir", type=str, default=None, help="Directory to write a JSON summary of results.")
+    p.add_argument("--skip-nmm", action="store_true", help="Skip the segmented-with-NMM variant (useful for smaller models where default NMM layers don't exist).")
+    p.add_argument("--skip-segmented", action="store_true", help="Skip the segmented-no-NMM variant.")
+    p.add_argument("--skip-base", action="store_true", help="Skip the base LLaMA variant.")
+    p.add_argument("--nmm-layers", type=int, nargs="+", default=None, help="Layer indices for neural memory (e.g. --nmm-layers 4 8 12). Overrides the default (8,16,24).")
+    p.add_argument("--nmm-segment-len", type=int, default=None, help="Neural memory segment length (defaults to --nmm-chunk-size).")
+    p.add_argument("--nmm-depth", type=int, default=2, help="Neural memory MLP depth.")
+    p.add_argument("--use-lora", action="store_true", help="Enable LoRA adapters on Titan variants.")
+    p.add_argument("--lora-rank", type=int, default=8, help="LoRA rank.")
+    p.add_argument("--lora-alpha", type=int, default=16, help="LoRA alpha.")
+    p.add_argument("--lora-dropout", type=float, default=0.0, help="LoRA dropout.")
+    p.add_argument("--lora-layers-after-memory", type=int, default=1, help="Number of layers after each memory layer that get LoRA.")
+    p.add_argument("--segmented-layers", type=int, nargs="+", default=None, help="Layer indices that use segmented attention (e.g. --segmented-layers 0 1 2 3). Default: all layers.")
+    p.add_argument("--max-gen-len", type=int, default=4096, help="Max generation length to sweep up to (from the set 16,32,64,...,4096).")
+    p.add_argument("--use-flash-attn", action="store_true", help="Enable Flash Attention 2 for both base LLaMA and Titan variants.")
     return p.parse_args()
 
 
@@ -67,14 +81,19 @@ def _ensure_pad_token(tokenizer) -> None:
     tokenizer.padding_side = "left"
 
 
-def build_base_llama(model_name: str, torch_dtype: torch.dtype, device: torch.device):
+def build_base_llama(model_name: str, torch_dtype: torch.dtype, device: torch.device, use_flash_attn: bool = False):
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     _ensure_pad_token(tokenizer)
+
+    extra = {}
+    if use_flash_attn:
+        extra["attn_implementation"] = "sdpa"
 
     model = AutoModelForCausalLM.from_pretrained(
         model_name,
         torch_dtype=torch_dtype,
         device_map="auto" if device.type == "cuda" else None,
+        **extra,
     )
     model.eval()
     if device.type != "cuda":
@@ -93,7 +112,19 @@ def build_titan_variant(
     use_flex_attn: bool,
     neural_memory_chunk_size: int,
     neural_memory_batch_size: int,
+    neural_memory_segment_len: Optional[int] = None,
+    neural_memory_depth: int = 2,
+    use_lora: bool = False,
+    lora_rank: int = 8,
+    lora_alpha: int = 16,
+    lora_dropout: float = 0.0,
+    lora_layers_after_memory: int = 1,
+    segmented_attention_layers: Optional[Tuple[int, ...]] = None,
+    use_flash_attn: bool = False,
 ):
+    if neural_memory_segment_len is None:
+        neural_memory_segment_len = neural_memory_chunk_size
+
     base_cfg = AutoConfig.from_pretrained(model_name)
     titan_cfg = TitanLLaMAConfig.from_llama_config(
         base_cfg,
@@ -101,14 +132,21 @@ def build_titan_variant(
         num_persist_mem_tokens=num_persist,
         num_longterm_mem_tokens=num_longterm,
         neural_memory_layers=tuple(neural_memory_layers),
-        neural_memory_segment_len=neural_memory_chunk_size if neural_memory_layers else 0,
+        neural_memory_segment_len=neural_memory_segment_len if neural_memory_layers else 0,
         neural_memory_batch_size=neural_memory_batch_size if neural_memory_layers else 0,
-        neural_memory_depth=2 if neural_memory_layers else 0,
+        neural_memory_depth=neural_memory_depth if neural_memory_layers else 0,
         use_flex_attn=use_flex_attn,
+        use_flash_attn=use_flash_attn,
         sliding_window_attn=True,
         use_pretrained_backbone=True,
         base_model_name_or_path=model_name,
         freeze_backbone=True,
+        use_lora=use_lora,
+        lora_rank=lora_rank,
+        lora_alpha=lora_alpha,
+        lora_dropout=lora_dropout,
+        lora_layers_after_memory=lora_layers_after_memory,
+        segmented_attention_layers=segmented_attention_layers,
     )
 
     tokenizer = AutoTokenizer.from_pretrained(model_name)
@@ -178,7 +216,7 @@ def benchmark_single_generation(
                 max_new_tokens=max_new_tokens,
                 do_sample=False,
                 temperature=temperature,
-                use_cache=False,
+                use_cache=True,
             )
     elif hasattr(model, "generate_with_titan_memory"):
         def run_generate(max_new_tokens: int) -> torch.Tensor:
@@ -188,7 +226,7 @@ def benchmark_single_generation(
                 temperature=temperature,
                 do_sample=False,
                 reset_memory=True,
-                use_cache=False,
+                use_cache=True,
             )
     else:
         raise ValueError(f"Model {variant_name} has no generation method.")
@@ -294,7 +332,7 @@ def benchmark_generation(
                     max_new_tokens=step_max_new_tokens,
                     do_sample=False,
                     temperature=temperature,
-                    use_cache=False,
+                    use_cache=True,
                 )
         elif hasattr(model, "generate_with_titan_memory"):
             def _run(step_max_new_tokens: int) -> torch.Tensor:
@@ -304,7 +342,7 @@ def benchmark_generation(
                     temperature=temperature,
                     do_sample=False,
                     reset_memory=True,
-                    use_cache=False,
+                    use_cache=True,
                 )
         else:
             raise ValueError(f"Model {variant_name} has no generation method.")
@@ -406,45 +444,65 @@ def main() -> None:
             "falling back to chunk size 1."
         )
         nmm_chunk = 1
+    nmm_layers = tuple(args.nmm_layers) if args.nmm_layers else (8, 16, 24)
     # --------------------------------------------------
 
-    # Build the three variants
+    # Shared kwargs for LoRA / NMM depth / NMM segment len
+    seg_layers = tuple(args.segmented_layers) if args.segmented_layers else None
+    titan_extra = dict(
+        neural_memory_segment_len=args.nmm_segment_len,
+        neural_memory_depth=args.nmm_depth,
+        use_lora=args.use_lora,
+        lora_rank=args.lora_rank,
+        lora_alpha=args.lora_alpha,
+        lora_dropout=args.lora_dropout,
+        lora_layers_after_memory=args.lora_layers_after_memory,
+        segmented_attention_layers=seg_layers,
+        use_flash_attn=args.use_flash_attn,
+    )
+
+    # Build the variants
     variants: List[Tuple[str, Callable[[], Tuple[torch.nn.Module, Any]]]] = []
-    variants.append(("base_llama", lambda: build_base_llama(args.model, torch_dtype, device)))
-    variants.append(
-        (
-            "segmented_no_nmm",
-            lambda: build_titan_variant(
-                args.model,
-                torch_dtype,
-                device,
-                args.segment_len,
-                args.num_persist,
-                args.num_longterm,
-                neural_memory_layers=(),
-                use_flex_attn=args.use_flex_attn,
-                neural_memory_chunk_size=nmm_chunk,
-                neural_memory_batch_size=nmm_batch,
-            ),
+    if not args.skip_base:
+        variants.append(("base_llama", lambda: build_base_llama(args.model, torch_dtype, device, use_flash_attn=args.use_flash_attn)))
+    if not args.skip_segmented:
+        variants.append(
+            (
+                "segmented_no_nmm",
+                lambda: build_titan_variant(
+                    args.model,
+                    torch_dtype,
+                    device,
+                    args.segment_len,
+                    args.num_persist,
+                    args.num_longterm,
+                    neural_memory_layers=(),
+                    use_flex_attn=args.use_flex_attn,
+                    neural_memory_chunk_size=nmm_chunk,
+                    neural_memory_batch_size=nmm_batch,
+                    **titan_extra,
+                ),
+            )
         )
-    )
-    variants.append(
-        (
-            "segmented_with_nmm",
-            lambda: build_titan_variant(
-                args.model,
-                torch_dtype,
-                device,
-                args.segment_len,
-                args.num_persist,
-                args.num_longterm,
-                neural_memory_layers=(8, 16, 24),
-                use_flex_attn=args.use_flex_attn,
-                neural_memory_chunk_size=nmm_chunk,
-                neural_memory_batch_size=nmm_batch,
-            ),
+    if not args.skip_nmm:
+        variants.append(
+            (
+                "segmented_with_nmm",
+                lambda: build_titan_variant(
+                    args.model,
+                    torch_dtype,
+                    device,
+                    args.segment_len,
+                    args.num_persist,
+                    args.num_longterm,
+                    neural_memory_layers=nmm_layers,
+                    use_flex_attn=args.use_flex_attn,
+                    neural_memory_chunk_size=nmm_chunk,
+                    neural_memory_batch_size=nmm_batch,
+                    **titan_extra,
+                ),
+            )
         )
-    )
 
     # Optional: you can reorder if you want segmented first
     variants.reverse()
@@ -453,9 +511,8 @@ def main() -> None:
     prompt_len = args.prompt_length
     print(f"[info] using prompt_length = {prompt_len} tokens")
 
-    # Generation lengths to sweep
-    gen_lengths = [16, 32, 64, 128, 256, 512, 1024, 2048, 4096]
-    # gen_lengths.reverse()
+    # Generation lengths to sweep (capped by --max-gen-len)
+    gen_lengths = [g for g in [8192*2, 8192*4] if g <= args.max_gen_len]
 
     all_results: List[dict] = []
 

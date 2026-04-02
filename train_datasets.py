@@ -243,14 +243,16 @@ class BoolQDataset(TorchDataset):
         question = item["question"]
         answer = bool(item["answer"])
 
-        text = (
+        prompt = (
             f"Passage: {passage}\n"
             f"Question: {question}\n"
-            f"Answer (yes or no): {'yes' if answer else 'no'}"
+            f"Answer (yes or no): "
         )
+        answer_text = "yes" if answer else "no"
+        full_text = prompt + answer_text
 
         tokens = self.tokenizer(
-            text,
+            full_text,
             max_length=self.max_length,
             padding="max_length",
             truncation=True,
@@ -261,11 +263,24 @@ class BoolQDataset(TorchDataset):
         input_ids = tokens["input_ids"].squeeze(0).to("cpu", non_blocking=False)
         attention_mask = tokens["attention_mask"].squeeze(0).to("cpu", non_blocking=False)
 
-        labels = input_ids.clone()  # already CPU
-        labels[attention_mask == 0] = -100  # Ignore padding in loss
+        # Tokenize prompt alone to find where the answer starts
+        prompt_tokens = self.tokenizer(
+            prompt, truncation=True, add_special_tokens=True, return_tensors="pt",
+        )
+        prompt_ids = prompt_tokens["input_ids"]
+        if prompt_ids[0, -1] == self.tokenizer.eos_token_id:
+            prompt_ids = prompt_ids[:, :-1]
+        prompt_length = prompt_ids.shape[1]
 
-        # Optional debug: uncomment if you want to confirm devices
-        # print("BoolQ devices:", input_ids.device, attention_mask.device, labels.device)
+        # Only compute loss on answer tokens
+        labels = input_ids.clone()
+        labels[:prompt_length] = -100
+        labels[attention_mask == 0] = -100
+        # If answer was truncated away, keep last non-padding token to avoid NaN loss
+        if (labels != -100).sum() == 0:
+            last_valid = attention_mask.sum() - 1
+            if last_valid >= 0:
+                labels[last_valid] = input_ids[last_valid]
 
         assert input_ids.device.type == "cpu"
         assert attention_mask.device.type == "cpu"
@@ -343,17 +358,22 @@ class WinograndeDataset(TorchDataset):
         attention_mask = tokens["attention_mask"].squeeze(0).to("cpu", non_blocking=False)
 
         prompt_only_tokens = self.tokenizer(
-            prompt,
-            truncation=True,
-            add_special_tokens=True,
-            return_tensors="pt",
+            prompt, truncation=True, add_special_tokens=True, return_tensors="pt",
         )
-        prompt_length = prompt_only_tokens["input_ids"].shape[1]
+        prompt_ids = prompt_only_tokens["input_ids"]
+        if prompt_ids[0, -1] == self.tokenizer.eos_token_id:
+            prompt_ids = prompt_ids[:, :-1]
+        prompt_length = prompt_ids.shape[1]
 
+        # Only compute loss on answer tokens
         labels = input_ids.clone()
-        labels[attention_mask == 0] = -100  # Ignore padding in loss
-        # if prompt_length < labels.shape[0]:
-        #     labels[:prompt_length] = -100
+        labels[:prompt_length] = -100
+        labels[attention_mask == 0] = -100
+        # If answer was truncated away, keep last non-padding token to avoid NaN loss
+        if (labels != -100).sum() == 0:
+            last_valid = attention_mask.sum() - 1
+            if last_valid >= 0:
+                labels[last_valid] = input_ids[last_valid]
 
         assert input_ids.device.type == "cpu"
         assert attention_mask.device.type == "cpu"
@@ -521,33 +541,24 @@ class PubMedQADataset(TorchDataset):
         input_ids = tokens["input_ids"].squeeze(0).to("cpu", non_blocking=False)
         attention_mask = tokens["attention_mask"].squeeze(0).to("cpu", non_blocking=False)
 
-        labels = input_ids.clone()
-        labels[attention_mask == 0] = -100  # Ignore padding in loss
-
         # Tokenize just the prompt to find where the answer starts
-        # prompt_tokens = self.tokenizer(
-        #     prompt,
-        #     truncation=True,
-        #     add_special_tokens=True,
-        #     return_tensors="pt",
-        # )
+        prompt_tokens = self.tokenizer(
+            prompt, truncation=True, add_special_tokens=True, return_tensors="pt",
+        )
+        prompt_ids = prompt_tokens["input_ids"]
+        if prompt_ids[0, -1] == self.tokenizer.eos_token_id:
+            prompt_ids = prompt_ids[:, :-1]
+        prompt_length = prompt_ids.shape[1]
 
-        # prompt_ids = prompt_tokens["input_ids"]
-
-        # if prompt_ids[0, -1] == self.tokenizer.eos_token_id:
-        #     prompt_ids = prompt_ids[:, :-1]
-
-        # prompt_length = prompt_ids.shape[1]
-
-        # # Initialize labels with -100 (ignored in loss)
-        # labels = torch.full_like(input_ids, -100)
-        
-        # # Only compute loss on the final decision token(s)
-        # # The answer starts at prompt_length
-        # if prompt_length < input_ids.shape[0]:
-        #     # Set labels for the answer tokens (typically just one token for yes/no/maybe)
-        #     # We want to predict the first token of the answer
-        #     labels[prompt_length] = input_ids[prompt_length]
+        # Only compute loss on answer tokens
+        labels = input_ids.clone()
+        labels[:prompt_length] = -100
+        labels[attention_mask == 0] = -100
+        # If answer was truncated away, keep last non-padding token to avoid NaN loss
+        if (labels != -100).sum() == 0:
+            last_valid = attention_mask.sum() - 1
+            if last_valid >= 0:
+                labels[last_valid] = input_ids[last_valid]
 
         assert input_ids.device.type == "cpu"
         assert attention_mask.device.type == "cpu"
@@ -616,14 +627,15 @@ class DROPDataset(TorchDataset):
             answer = str(answers_dict)
 
         # Format as reading comprehension
-        text = (
+        prompt = (
             f"Passage: {passage}\n"
             f"Question: {question}\n"
-            f"Answer: {answer}"
+            f"Answer: "
         )
+        full_text = prompt + answer
 
         tokens = self.tokenizer(
-            text,
+            full_text,
             max_length=self.max_length,
             padding="max_length",
             truncation=True,
@@ -633,8 +645,24 @@ class DROPDataset(TorchDataset):
         input_ids = tokens["input_ids"].squeeze(0).to("cpu", non_blocking=False)
         attention_mask = tokens["attention_mask"].squeeze(0).to("cpu", non_blocking=False)
 
+        # Tokenize prompt alone to find where the answer starts
+        prompt_tokens = self.tokenizer(
+            prompt, truncation=True, add_special_tokens=True, return_tensors="pt",
+        )
+        prompt_ids = prompt_tokens["input_ids"]
+        if prompt_ids[0, -1] == self.tokenizer.eos_token_id:
+            prompt_ids = prompt_ids[:, :-1]
+        prompt_length = prompt_ids.shape[1]
+
+        # Only compute loss on answer tokens
         labels = input_ids.clone()
-        labels[attention_mask == 0] = -100  # Ignore padding in loss
+        labels[:prompt_length] = -100
+        labels[attention_mask == 0] = -100
+        # If answer was truncated away, keep last non-padding token to avoid NaN loss
+        if (labels != -100).sum() == 0:
+            last_valid = attention_mask.sum() - 1
+            if last_valid >= 0:
+                labels[last_valid] = input_ids[last_valid]
 
         assert input_ids.device.type == "cpu"
         assert attention_mask.device.type == "cpu"
@@ -703,14 +731,15 @@ class SQuADv2Dataset(TorchDataset):
             answer = "No answer"
 
         # Format as QA task
-        text = (
+        prompt = (
             f"Context: {context}\n"
             f"Question: {question}\n"
-            f"Answer: {answer}"
+            f"Answer: "
         )
+        full_text = prompt + answer
 
         tokens = self.tokenizer(
-            text,
+            full_text,
             max_length=self.max_length,
             padding="max_length",
             truncation=True,
@@ -720,8 +749,24 @@ class SQuADv2Dataset(TorchDataset):
         input_ids = tokens["input_ids"].squeeze(0).to("cpu", non_blocking=False)
         attention_mask = tokens["attention_mask"].squeeze(0).to("cpu", non_blocking=False)
 
+        # Tokenize prompt alone to find where the answer starts
+        prompt_tokens = self.tokenizer(
+            prompt, truncation=True, add_special_tokens=True, return_tensors="pt",
+        )
+        prompt_ids = prompt_tokens["input_ids"]
+        if prompt_ids[0, -1] == self.tokenizer.eos_token_id:
+            prompt_ids = prompt_ids[:, :-1]
+        prompt_length = prompt_ids.shape[1]
+
+        # Only compute loss on answer tokens
         labels = input_ids.clone()
-        labels[attention_mask == 0] = -100  # Ignore padding in loss
+        labels[:prompt_length] = -100
+        labels[attention_mask == 0] = -100
+        # If answer was truncated away, keep last non-padding token to avoid NaN loss
+        if (labels != -100).sum() == 0:
+            last_valid = attention_mask.sum() - 1
+            if last_valid >= 0:
+                labels[last_valid] = input_ids[last_valid]
 
         assert input_ids.device.type == "cpu"
         assert attention_mask.device.type == "cpu"
@@ -791,14 +836,15 @@ class CommonsenseQADataset(TorchDataset):
         answer_key = item.get("answerKey", "")
 
         # Format as multiple choice
-        text = (
+        prompt = (
             f"Question: {question}\n"
             f"Choices:\n{choices_formatted}\n"
-            f"Answer: {answer_key}"
+            f"Answer: "
         )
+        full_text = prompt + answer_key
 
         tokens = self.tokenizer(
-            text,
+            full_text,
             max_length=self.max_length,
             padding="max_length",
             truncation=True,
@@ -808,8 +854,24 @@ class CommonsenseQADataset(TorchDataset):
         input_ids = tokens["input_ids"].squeeze(0).to("cpu", non_blocking=False)
         attention_mask = tokens["attention_mask"].squeeze(0).to("cpu", non_blocking=False)
 
+        # Tokenize prompt alone to find where the answer starts
+        prompt_tokens = self.tokenizer(
+            prompt, truncation=True, add_special_tokens=True, return_tensors="pt",
+        )
+        prompt_ids = prompt_tokens["input_ids"]
+        if prompt_ids[0, -1] == self.tokenizer.eos_token_id:
+            prompt_ids = prompt_ids[:, :-1]
+        prompt_length = prompt_ids.shape[1]
+
+        # Only compute loss on answer tokens
         labels = input_ids.clone()
-        labels[attention_mask == 0] = -100  # Ignore padding in loss
+        labels[:prompt_length] = -100
+        labels[attention_mask == 0] = -100
+        # If answer was truncated away, keep last non-padding token to avoid NaN loss
+        if (labels != -100).sum() == 0:
+            last_valid = attention_mask.sum() - 1
+            if last_valid >= 0:
+                labels[last_valid] = input_ids[last_valid]
 
         assert input_ids.device.type == "cpu"
         assert attention_mask.device.type == "cpu"
@@ -1028,54 +1090,42 @@ class CaseHOLDDataset(TorchDataset):
             assert False, f"Invalid label index {label_idx} for CaseHOLD example {idx}"
             # answer_letter = "A"  # fallback, shouldn't really happen
 
-        text = (
+        prompt = (
             f"Context: {context}\n"
             f"Possible holdings:\n{choices_formatted}\n"
-            f"Answer: {answer_letter}"
+            f"Answer: "
         )
+        full_text = prompt + answer_letter
 
         tokens = self.tokenizer(
-            text,
+            full_text,
             max_length=self.max_length,
             padding="max_length",
             truncation=True,
             return_tensors="pt",
         )
 
-
-        # prompt = text = (
-        #     f"Context: {context}\n"
-        #     f"Possible holdings:\n{choices_formatted}\n"
-        #     f"Answer: "
-        # )
-
         input_ids = tokens["input_ids"].squeeze(0).to("cpu", non_blocking=False)
         attention_mask = tokens["attention_mask"].squeeze(0).to("cpu", non_blocking=False)
+
+        # Tokenize prompt alone to find where the answer starts
+        prompt_tokens = self.tokenizer(
+            prompt, truncation=True, add_special_tokens=True, return_tensors="pt",
+        )
+        prompt_ids = prompt_tokens["input_ids"]
+        if prompt_ids[0, -1] == self.tokenizer.eos_token_id:
+            prompt_ids = prompt_ids[:, :-1]
+        prompt_length = prompt_ids.shape[1]
+
+        # Only compute loss on answer tokens
         labels = input_ids.clone()
-        labels[attention_mask == 0] = -100  # Ignore padding in loss
-        # prompt_tokens = self.tokenizer(
-        #     prompt,
-        #     truncation=True,
-        #     add_special_tokens=True,
-        #     return_tensors="pt",
-        # )
-
-        # prompt_ids = prompt_tokens["input_ids"]
-
-        # if prompt_ids[0, -1] == self.tokenizer.eos_token_id:
-        #     prompt_ids = prompt_ids[:, :-1]
-
-        # prompt_length = prompt_ids.shape[1]
-        
-        # # Initialize labels with -100 (ignored in loss)
-        # labels = torch.full_like(input_ids, -100)
-        
-        # # Only compute loss on the final decision token(s)
-        # # The answer starts at prompt_length
-        # if prompt_length < input_ids.shape[0]:
-        #     # Set labels for the answer tokens (typically just one token for yes/no/maybe)
-        #     # We want to predict the first token of the answer
-        #     labels[prompt_length] = input_ids[prompt_length]
+        labels[:prompt_length] = -100
+        labels[attention_mask == 0] = -100
+        # If answer was truncated away, keep last non-padding token to avoid NaN loss
+        if (labels != -100).sum() == 0:
+            last_valid = attention_mask.sum() - 1
+            if last_valid >= 0:
+                labels[last_valid] = input_ids[last_valid]
 
         assert input_ids.device.type == "cpu"
         assert attention_mask.device.type == "cpu"

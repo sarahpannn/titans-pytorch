@@ -3,11 +3,11 @@ export CUDA_VISIBLE_DEVICES=1
 
 python3 run_training.py \
     --pretrained_from_checkpoint titan_llama_checkpoints/latest_checkpoint.pt \
-    --dataset_name winogrande \
-    --segment_len 128 \
+    --dataset_name mixed \
+    --segment_len 64 \
     --sequence_length 128 \
     --batch_size 64 \
-    --micro_batch_size 16 \
+    --micro_batch_size 8 \
     --num_persist_mem 0 \
     --neural_memory_segment_len 64 \
     --neural_memory_batch_size 64 \
@@ -22,6 +22,6 @@ python3 run_training.py \
     --intermittent_eval_start_step 1 \
     --use_attention_distillation \
     --distillation_weight 0.85 \
-    --distillation_layers "4,8,12,16,20" \
-    --neural_memory_layers "4,8,12,16,20" \
+    --distillation_layers "3" \
+    --neural_memory_layers "3" \
     --save_interval 40

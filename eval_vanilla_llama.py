@@ -171,9 +171,28 @@ def main():
     task_dict = tasks.get_task_dict(args.tasks)
     results = evaluator.evaluate(lm=lm, task_dict=task_dict, limit=args.limit)
 
+    # Write concise summary (task -> metric -> score)
+    summary_lines = [f"Model: {args.model}", ""]
+    for task_name, task_results in results.get("results", {}).items():
+        summary_lines.append(f"{task_name}:")
+        for metric, value in task_results.items():
+            if metric == "alias" or "stderr" in metric:
+                continue
+            stderr_key = metric.replace(",none", "_stderr,none")
+            stderr = task_results.get(stderr_key)
+            if isinstance(value, (int, float)) and isinstance(stderr, (int, float)):
+                summary_lines.append(f"  {metric}: {value:.4f} ± {stderr:.4f}")
+            elif isinstance(value, (int, float)):
+                summary_lines.append(f"  {metric}: {value:.4f}")
+            else:
+                summary_lines.append(f"  {metric}: {value}")
+        summary_lines.append("")
+
+    summary = "\n".join(summary_lines)
+    print(summary)
     with open(args.output, "w") as f:
-        f.write(str(results))
-    
+        f.write(summary)
+
     print(f"Results saved to {args.output}")
 
 

@@ -1,0 +1,11 @@
+Model: unsloth/Llama-3.2-1B-Instruct
+
+boolq:
+  acc,none: 0.6939 ± 0.0081
+
+hellaswag:
+  acc,none: 0.4515 ± 0.0050
+  acc_norm,none: 0.6080 ± 0.0049
+
+winogrande:
+  acc,none: 0.5967 ± 0.0138

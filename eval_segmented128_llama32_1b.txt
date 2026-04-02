@@ -1,0 +1,11 @@
+Model: unsloth/Llama-3.2-1B-Instruct  |  segment_len: 128
+
+boolq:
+  acc,none: 0.5006
+
+hellaswag:
+  acc,none: 0.3642
+  acc_norm,none: 0.4516
+
+winogrande:
+  acc,none: 0.5391

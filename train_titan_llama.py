@@ -45,7 +45,7 @@ from tqdm import tqdm
 from titan_llama import TitanLLaMAConfig, TitanLLaMAForCausalLM
 from train_datasets import SlimPajamaDataset, FineWebEduDataset, BoolQDataset, WinograndeDataset, MixedEvalDataset, PubMedQADataset, HugeMixedDataset, CaseHOLDDataset, AquaRATDataset
 from cuda_utils import log_cuda_mem
-from simple_eval import eval_winogrande_boolq, quick_eval_boolq, should_run_intermittent_eval, log_eval_metrics, eval_pubmedqa, eval_commonsenseqa, eval_drop, eval_squadv2, eval_casehold, eval_aquarat, eval_boolq, eval_winogrande
+from simple_eval import eval_winogrande_boolq, quick_eval_boolq, should_run_intermittent_eval, log_eval_metrics, eval_pubmedqa, eval_commonsenseqa, eval_drop, eval_squadv2, eval_casehold, eval_aquarat, eval_boolq, eval_winogrande, eval_hellaswag
 
 
 def compute_attention_distillation_loss(
@@ -125,6 +125,10 @@ def compute_attention_distillation_loss(
         # make sure teacher matches student dtype/device
         t_h = t_h.to(device=s_h.device, dtype=s_h.dtype)
 
+        # L2-normalize along hidden dim so MSE is scale-invariant
+        s_h = F.normalize(s_h, dim=-1)
+        t_h = F.normalize(t_h, dim=-1)
+
         layer_loss = F.mse_loss(s_h, t_h.detach())
         total_loss += layer_loss
         counted_layers += 1
@@ -162,6 +166,8 @@ class TrainingConfig:
     neural_mem_gate_attn_output: bool = False
     neural_mem_weight_residual: bool = True
     num_neural_mem_kv_tokens: int = 4
+    zero_init_mem_to_kv: bool = True
+    use_value_residual: bool = True
     
     # Training configuration
     total_tokens: int = 1_000_000_000  # 1B tokens
@@ -291,6 +297,8 @@ def create_model_and_optimizer(config: TrainingConfig, device):
         neural_mem_gate_attn_output=config.neural_mem_gate_attn_output,
         neural_mem_weight_residual=config.neural_mem_weight_residual,
         num_neural_mem_kv_tokens=config.num_neural_mem_kv_tokens,
+        zero_init_mem_to_kv=config.zero_init_mem_to_kv,
+        use_value_residual=config.use_value_residual,
         use_pretrained_backbone=config.use_pretrained_backbone,
         base_model_name_or_path=config.base_model_name,
         freeze_backbone=config.freeze_backbone,
@@ -316,12 +324,13 @@ def create_model_and_optimizer(config: TrainingConfig, device):
         # model = model.to(device)
     
     # Align training config with backbone in case it was derived from a pretrained checkpoint
-    config.hidden_size = model.model.config.hidden_size
-    config.intermediate_size = model.model.config.intermediate_size
-    config.num_hidden_layers = model.model.config.num_hidden_layers
-    config.num_attention_heads = model.model.config.num_attention_heads
-    config.num_key_value_heads = model.model.config.num_key_value_heads
-    config.vocab_size = model.model.config.vocab_size
+    hf_cfg = model.backbone.config
+    config.hidden_size = hf_cfg.hidden_size
+    config.intermediate_size = hf_cfg.intermediate_size
+    config.num_hidden_layers = hf_cfg.num_hidden_layers
+    config.num_attention_heads = hf_cfg.num_attention_heads
+    config.num_key_value_heads = hf_cfg.num_key_value_heads
+    config.vocab_size = hf_cfg.vocab_size
     
     # Print model size
     total_params = sum(p.numel() for p in model.parameters())
@@ -356,9 +365,8 @@ def create_model_and_optimizer(config: TrainingConfig, device):
         else:
             bucket_counts["other"] += p.numel()
 
-        # print("\n[create_model_and_optimizer] Trainable param breakdown:")
-        for k, v in bucket_counts.items():
-            print(f"  - {k:18s}: {v:,} ({v/1e6:.2f}M)")
+    for k, v in bucket_counts.items():
+        print(f"  - {k:18s}: {v:,} ({v/1e6:.2f}M)")
 
         # Separate parameters for different optimization: neural memory, LoRA, and regular
         neural_memory_params = []
@@ -564,14 +572,17 @@ def main(config=None):
                            help="Weight for distillation loss vs LM loss (default: 0.1)")
         parser.add_argument("--distillation-layers", nargs="+", type=int, default=[8, 16, 24],
                            help="Which layers to apply distillation to (default: 8 16 24)")
-        
+        parser.add_argument("--no-value-residual", action="store_true",
+                           help="Disable the value residual stream across attention layers")
+
         args = parser.parse_args()
         
         # Create config with command-line overrides
         config = TrainingConfig(
             use_attention_distillation=args.use_attention_distillation,
             distillation_weight=args.distillation_weight,
-            distillation_layers=tuple(args.distillation_layers)
+            distillation_layers=tuple(args.distillation_layers),
+            use_value_residual=not args.no_value_residual,
         )
     
     # Set up logging
@@ -825,7 +836,7 @@ def main(config=None):
             if config.use_attention_distillation:
                 distill_loss = compute_attention_distillation_loss(
                     outputs['hidden_states'], 
-                    model.backbone_model, 
+                    model.backbone, 
                     input_ids, 
                     attention_mask, 
                     config.distillation_layers, 
@@ -1000,20 +1011,29 @@ def main(config=None):
                     max_examples=config.intermittent_eval_limit,
                     batch_size=config.micro_batch_size,
                 )
+                hellaswag_metrics = eval_hellaswag(
+                    model=model,
+                    tokenizer=tokenizer,
+                    device=device,
+                    max_examples=config.intermittent_eval_limit,
+                    batch_size=config.micro_batch_size,
+                )
 
                 eval_metrics.update(winogrande_metrics)
 
                 eval_metrics.update(commonqa_metrics)
                 eval_metrics.update(drop_metrics)
                 eval_metrics.update(squad2)
+                eval_metrics.update(hellaswag_metrics)
 
                 logger.info(
                 f"[eval] step {step} "
                 f"BoolQ acc={eval_metrics['boolq_acc']:.3f}, "
-                f"Winogrande acc={eval_metrics['winogrande_acc']:.3f}"
+                f"Winogrande acc={eval_metrics['winogrande_acc']:.3f}, "
                 f"CommonsenseQA acc={eval_metrics['commonsenseqa_acc']:.3f}, "
                 f"DROP F1={eval_metrics['drop_acc']:.3f}, "
-                f"SQuAD2 F1={eval_metrics['squadv2_acc']:.3f} "
+                f"SQuAD2 F1={eval_metrics['squadv2_acc']:.3f}, "
+                f"HellaSwag acc={eval_metrics['hellaswag_acc']:.3f} "
             )
             elif 'pubmed' in config.dataset_name:
                 eval_metrics = eval_pubmedqa(
@@ -1091,13 +1111,43 @@ def main(config=None):
         ret_dict = evaluate_model(model, eval_dataloader, device)
         final_eval_loss, final_eval_acc = ret_dict['loss'], ret_dict['acc']
         logger.info(f"Final eval loss: {final_eval_loss:.4f}")
-        
+
+        # Final benchmark evaluation suite
+        model.eval()
+        try:
+            if hasattr(model, 'reset_memory_states'):
+                model.reset_memory_states()
+            elif hasattr(model, 'module') and hasattr(model.module, 'reset_memory_states'):
+                model.module.reset_memory_states()
+        except Exception as e:
+            logger.warning(f"Failed to reset memory states before final eval: {str(e)}")
+
+        final_benchmarks = {}
+        for eval_fn in [eval_boolq, eval_winogrande, eval_commonsenseqa, eval_drop, eval_squadv2, eval_hellaswag]:
+            try:
+                metrics = eval_fn(
+                    model=model,
+                    tokenizer=tokenizer,
+                    device=device,
+                    max_examples=config.intermittent_eval_limit,
+                    batch_size=config.micro_batch_size,
+                )
+                final_benchmarks.update(metrics)
+            except Exception as e:
+                logger.warning(f"Final eval {eval_fn.__name__} failed: {str(e)}")
+
+        logger.info(f"Final benchmark results: {final_benchmarks}")
+        model.train()
+
         if wandb and wandb.run:
-            wandb.log({
+            final_log = {
                 'eval/final_loss': final_eval_loss,
                 'eval/final_acc': final_eval_acc,
                 'train/final_step': config.total_steps
-            })
+            }
+            for k, v in final_benchmarks.items():
+                final_log[f'eval/final_{k}'] = v
+            wandb.log(final_log)
             wandb.finish()
 
 

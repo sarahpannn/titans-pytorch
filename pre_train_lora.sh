@@ -19,7 +19,7 @@ python3 run_training.py \
     --save_interval 2000 \
     --learning_rate 1e-4 \
     --min_learning_rate 1e-9 \
-    --neural_mem_lr 5e-3 \
+    --neural_mem_lr 1e-3 \
     --log_interval 1 \
     --intermittent_eval_frequency 100 \
     --intermittent_eval_limit 256 \

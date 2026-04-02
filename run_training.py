@@ -104,8 +104,11 @@ def parse_args():
 def create_config_from_args(args):
     """Create TrainingConfig from command line arguments."""
     
-    # Parse neural memory layers
-    neural_memory_layers = tuple(map(int, args.neural_memory_layers.split(',')))
+    # Parse neural memory layers (empty string means no memory layers)
+    if args.neural_memory_layers.strip() == "":
+        neural_memory_layers = ()
+    else:
+        neural_memory_layers = tuple(map(int, args.neural_memory_layers.split(',')))
     
     # Parse distillation layers
     distillation_layers = tuple(map(int, args.distillation_layers.split(',')))

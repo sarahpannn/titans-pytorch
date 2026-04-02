@@ -345,11 +345,27 @@ def main() -> None:
         bootstrap_iters=args.bootstrap_iters,
     )
 
+    # Write concise summary (task -> metric -> score)
+    summary_lines = [f"Model: {args.model}  |  segment_len: {args.segment_len}", ""]
+    for task_name, task_results in results.get("results", {}).items():
+        summary_lines.append(f"{task_name}:")
+        for metric, value in task_results.items():
+            if metric == "alias" or "stderr" in metric:
+                continue
+            stderr_key = metric.replace(",none", "_stderr,none")
+            stderr = task_results.get(stderr_key)
+            if isinstance(value, (int, float)) and isinstance(stderr, (int, float)):
+                summary_lines.append(f"  {metric}: {value:.4f} ± {stderr:.4f}")
+            elif isinstance(value, (int, float)):
+                summary_lines.append(f"  {metric}: {value:.4f}")
+            else:
+                summary_lines.append(f"  {metric}: {value}")
+        summary_lines.append("")
+
+    summary = "\n".join(summary_lines)
+    print(summary)
     with open(args.eval_out, "w") as f:
-        f.write(str(results))
-    
-    # print("\n=== Full lm-eval output ===")
-    # print(json.dumps(results, indent=2))
+        f.write(summary)
 
 
 if __name__ == "__main__":
