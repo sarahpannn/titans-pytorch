@@ -1,12 +1,12 @@
 [project]
-name = "titans-pytorch"
-version = "0.5.5"
-description = "Titans"
+name = "titans-review-artifact"
+version = "0.1.0"
+description = "Anonymous code artifact for Titan-Llama experiments"
 authors = [
-    { name = "Phil Wang", email = "lucidrains@gmail.com" }
+    { name = "Anonymous Authors" }
 ]
 readme = "README.md"
-requires-python = ">= 3.9"
+requires-python = ">= 3.10"
 license = { file = "LICENSE" }
 keywords = [
     'artificial intelligence',
@@ -21,28 +21,31 @@ classifiers=[
     'Intended Audience :: Developers',
     'Topic :: Scientific/Engineering :: Artificial Intelligence',
     'License :: OSI Approved :: MIT License',
-    'Programming Language :: Python :: 3.9',
+    'Programming Language :: Python :: 3.10',
 ]
 
 dependencies = [
-    "assoc-scan>=0.0.4",
+    "assoc-scan",
     "axial_positional_embedding>=0.3.10",
     "einops>=0.8.0",
     "einx>=0.3.0",
-    "hyper-connections>=0.3.11",
+    "hyper-connections>=0.1.11",
     "Ninja",
     "rotary-embedding-torch",
-    "tensordict",
-    "torch>=2.8",
+    "torch>=2.9,<2.10",
     "tqdm",
     "x-transformers"
 ]
 
-[project.urls]
-Homepage = "https://pypi.org/project/titans-pytorch/"
-Repository = "https://github.com/lucidrains/titans-pytorch"
-
 [project.optional-dependencies]
+
+research = [
+    "datasets>=2.10.0",
+    "transformers==4.57.3",
+    "accelerate>=0.20.0",
+    "numpy>=1.21.0",
+    "wandb",
+]
 
 examples = [
     "adam-atan2-pytorch>=0.1.18",
@@ -73,9 +76,4 @@ allow-direct-references = true
 packages = ["titans_pytorch"]
 
 [tool.hatch.build.targets.sdist]
-include = [
-    "titans_pytorch",
-    "README.md",
-    "LICENSE",
-    "pyproject.toml",
-]
+exclude = ["/data", "/wandb", "/checkpoints", "/outputs", "*.pt", "*.out", "*.err"]

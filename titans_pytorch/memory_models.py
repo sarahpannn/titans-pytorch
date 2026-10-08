@@ -26,7 +26,7 @@ class LayerNorm(Module):
         gamma = self.gamma
 
         if gamma.ndim == 2:
-            gamma = rearrange(gamma, 'b d -> b 1 d')
+            gamma = gamma.unsqueeze(1)
 
         return self.ln(x) * (gamma + 1.)
 
@@ -56,9 +56,13 @@ class MemoryMLP(Module):
         self,
         dim,
         depth,
-        expansion_factor = 2.
+        expansion_factor = 2.,
+        activation = "gelu",
     ):
         super().__init__()
+        if activation != "gelu":
+            raise ValueError(f"unsupported MemoryMLP activation: {activation}")
+        self.activation = activation
         dim_hidden = int(dim * expansion_factor)
         dims = (dim, *((dim_hidden,) * (depth - 1)), dim)
 
@@ -67,17 +71,43 @@ class MemoryMLP(Module):
         for weight in self.weights:
             nn.init.xavier_uniform_(weight)
 
+    def _apply_memory_linear(self, x, weight, bias=None):
+        """
+        x:      [..., D]      or [B, H, D]
+        weight: [D, F]        or [H, D, F]
+        bias:   [F] or [H, F] (broadcastable)
+        """
+        if len(weight.shape) == 2:
+            # weight: [D, F]  (in, out) – this matches your 2-D prints
+            # so just do a standard linear
+            x = x @ weight
+        elif len(weight.shape) == 3:
+            # weight: [H, D, F]
+            # expect x: [B, H, D]
+            # per-head matmul: out[b, h, f] = sum_d x[b, h, d] * weight[h, d, f]
+            x = torch.einsum("bhd,hdf->bhf", x, weight)
+        else:
+            raise RuntimeError(
+                f"Unsupported weight.ndim={weight.ndim} for memory linear (x={x.shape}, w={weight.shape})"
+            )
+
+        if bias is not None:
+            x = x + bias
+
+        return x
+
     def forward(
         self,
         x
     ):
         for ind, weight in enumerate(self.weights):
-            is_first = ind == 0
-
-            if not is_first:
+            if ind > 0:
                 x = F.gelu(x)
 
-            x = x @ weight
+            if weight.ndim == 3 and x.ndim == 3:
+                x = torch.bmm(x, weight)
+            else:
+                x = x @ weight
 
         return x
 
@@ -151,6 +181,12 @@ class FactorizedMemoryMLP(Module):
         self,
         x
     ):
+        def apply_linear(input, weight):
+            if weight.ndim == 2:
+                return input @ weight
+            if weight.ndim == 3 and input.ndim == 3:
+                return torch.bmm(input, weight)
+            return input @ weight
 
         for ind, (weight1, weight2) in enumerate(self.weights):
             is_first = ind == 0
@@ -158,7 +194,7 @@ class FactorizedMemoryMLP(Module):
             if not is_first:
                 x = F.gelu(x)
 
-            x = x @ weight1 @ weight2
+            x = apply_linear(apply_linear(x, weight1), weight2)
 
         return x
 

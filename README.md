@@ -10,6 +10,17 @@ Unofficial implementation of [Titans](https://arxiv.org/abs/2501.00663) in Pytor
 
 [Quick Colab Run](https://colab.research.google.com/drive/11cGgSABykte3qbK-hjzPgLif3-9UUejm?usp=sharing)
 
+## Titan Llama in this fork
+
+This fork contains code for Titan-Llama, which adds NMM adapters to a
+pre-trained backbone. Existing attention layers are adapted to segmented
+attention and the NMM RNN recovers downstream language modeling loss.
+CUDA graphs are used for efficient inference.
+
+The model code is in `titan_llama.py`, with training scripts in `scripts/` and
+settings in `configs/`. Install with `pip install -e '.[research]'` and run
+`python scripts/pretrain.py 1024 --dry-run` to see the training settings.
+
 ## Appreciation
 
 - [Eryk](https://github.com/sentialx) for sharing his early experimental results with me, positive for 2 layer MLP
